@@ -1,0 +1,5 @@
+{
+  "name": "AI Product Ad Generator & Image Generator WITH CAMERA SETTINGS and mood",
+  "description": "Generate professional, real-world product advertisements by providing a product image, selecting a background, and adding a slogan. The app uses AI to create compelling ad visuals for various scenarios.",
+  "requestFramePermissions": []
+}
