@@ -10,6 +10,22 @@ import * as path from "path";
 
 const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
 
+// Mirrors the same detector used in services/geminiService.ts so the MCP
+// tool behaves identically to the app's "Full Prompt" mode: a long or
+// technically detailed scene description is treated as authoritative and
+// is NOT overwritten with generic product-hero/studio-lighting instructions.
+const checkIsComprehensive = (text: string): boolean => {
+  if (!text) return false;
+  const comprehensiveKeywords = [
+    "SHOT TYPE", "LIGHTING", "PRODUCT", "SKIN", "PHOTOGRAPHY",
+    "ENVIRONMENT", "CLOTHING", "CAMERA", "TONE", "SCENE DEFINITION",
+  ];
+  const hasKeywords = comprehensiveKeywords.some((keyword) =>
+    text.toUpperCase().includes(keyword)
+  );
+  return text.length > 250 || hasKeywords;
+};
+
 const server = new Server(
   {
     name: "adcraft-studio-mcp",
@@ -195,19 +211,29 @@ Please structure your response into the following clear sections:
       }
 
       // Build the rich prompt mimicking our app's logic
+      const isComprehensive = checkIsComprehensive(sceneDescription);
+
       const promptInstructions = [
-        "Task: Create a single, photorealistic advertisement image.",
-        `Product Focus: The image must clearly show the product "${productName}" as the hero of the image, sharply rendered.`,
-        `Scene Description: ${sceneDescription}`,
+        isComprehensive
+          ? "CRITICAL: FOLLOW THE DETAILED SCENE DEFINITION BELOW EXACTLY. IGNORE ALL OTHER UI PRESETS."
+          : "Task: Create a single, photorealistic advertisement image.",
+        !isComprehensive
+          ? `Product Focus: The image must clearly show the product "${productName}" as the hero of the image, sharply rendered.`
+          : "",
+        isComprehensive
+          ? `SCENE DEFINITION:\n${sceneDescription}`
+          : `Scene Description: ${sceneDescription}`,
       ];
 
-      if (style && style !== "None") promptInstructions.push(`Artistic Style: ${style}.`);
-      if (mood && mood !== "None") promptInstructions.push(`Overall Mood: ${mood}.`);
+      if (!isComprehensive && style && style !== "None") promptInstructions.push(`Artistic Style: ${style}.`);
+      if (!isComprehensive && mood && mood !== "None") promptInstructions.push(`Overall Mood: ${mood}.`);
       if (negativePrompt) promptInstructions.push(`Important Exclusion: The image must NOT contain ${negativePrompt}.`);
-      if (slogan) {
+      if (!isComprehensive && slogan) {
         promptInstructions.push(`Slogan Text Overlay: Subtly blend or creatively represent the text "${slogan}" in the scene layout.`);
       }
-      promptInstructions.push("Final Output: The final image must be a single, photorealistic photograph with professional, studio-grade commercial lighting.");
+      if (!isComprehensive) {
+        promptInstructions.push("Final Output: The final image must be a single, photorealistic photograph with professional, studio-grade commercial lighting.");
+      }
 
       const fullPromptText = promptInstructions.filter(Boolean).join("\n");
 
