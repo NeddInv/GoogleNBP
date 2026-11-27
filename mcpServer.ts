@@ -140,7 +140,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenAI({ 
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      }
+    }
+  });
 
   if (name === "generate_ad_copy") {
     try {
@@ -163,7 +170,7 @@ Please structure your response into the following clear sections:
 4. **LONG-FORM PERSUASIVE COPY** (A robust storytelling narrative utilizing copywriting frameworks like AIDA or PAS)`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.8-flash",
         contents: systemPrompt,
       });
 
@@ -237,9 +244,9 @@ Please structure your response into the following clear sections:
 
       const fullPromptText = promptInstructions.filter(Boolean).join("\n");
 
-      // We call the high-fidelity Imagen model using generateContent
+      // We call the high-fidelity Gemini Pro Image model using generateContent
       const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-image-preview",
+        model: "gemini-3-pro-image",
         contents: fullPromptText,
         config: {
           responseModalities: [Modality.IMAGE],
@@ -288,7 +295,7 @@ Please structure your response into the following clear sections:
         content: [
           {
             type: "text",
-            text: `Image generated successfully!\n\n- **Saved to**: ${fullPath}\n- **Filename**: ${actualFileName}\n- **Aspect Ratio**: ${aspectRatio}\n- **Image Size**: ${imageSize}\n- **Model Used**: gemini-3.1-flash-image-preview`,
+            text: `Image generated successfully!\n\n- **Saved to**: ${fullPath}\n- **Filename**: ${actualFileName}\n- **Aspect Ratio**: ${aspectRatio}\n- **Image Size**: ${imageSize}\n- **Model Used**: gemini-3-pro-image (PRO Quality)`,
           },
         ],
       };

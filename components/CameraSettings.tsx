@@ -9,6 +9,8 @@ interface CameraSettingsProps {
     onSavePreset: (name: string) => void;
     onDeletePreset: (id: string) => void;
     onApplyPreset: (preset: CameraPreset) => void;
+    onRestoreDefaultPresets?: () => void;
+    onSaveAsWorkspaceDefaults?: () => void;
 }
 
 const SelectInput: React.FC<{
@@ -36,7 +38,9 @@ export const CameraSettings: React.FC<CameraSettingsProps> = ({
     presets,
     onSavePreset,
     onDeletePreset,
-    onApplyPreset
+    onApplyPreset,
+    onRestoreDefaultPresets,
+    onSaveAsWorkspaceDefaults
 }) => {
     const [presetName, setPresetName] = useState('');
     const [showSaveInput, setShowSaveInput] = useState(false);
@@ -57,42 +61,66 @@ export const CameraSettings: React.FC<CameraSettingsProps> = ({
         <div className="space-y-6 p-4 bg-brand-primary rounded-lg">
             {/* Presets Section */}
             <div className="border-b border-gray-700 pb-6">
-                <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-sm font-semibold text-brand-accent uppercase tracking-wider">Presets</h3>
-                    {!showSaveInput ? (
-                        <button 
-                            onClick={() => setShowSaveInput(true)}
-                            className="flex items-center gap-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-md transition-colors"
-                        >
-                            <SparklesIcon className="w-3.5 h-3.5" />
-                            Save Current as Preset
-                        </button>
-                    ) : (
-                        <div className="flex items-center gap-2">
-                            <input 
-                                type="text"
-                                value={presetName}
-                                onChange={(e) => setPresetName(e.target.value)}
-                                placeholder="Preset name..."
-                                className="px-3 py-1.5 bg-brand-secondary border border-gray-600 rounded-md text-xs focus:ring-1 focus:ring-brand-accent focus:border-brand-accent outline-none"
-                                autoFocus
-                                onKeyDown={(e) => e.key === 'Enter' && handleSave()}
-                            />
-                            <button 
-                                onClick={handleSave}
-                                disabled={!presetName.trim()}
-                                className="px-3 py-1.5 bg-brand-accent text-brand-primary text-xs font-bold rounded-md hover:bg-indigo-400 disabled:bg-gray-500 disabled:cursor-not-allowed transition-colors"
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-semibold text-brand-accent uppercase tracking-wider">Presets</h3>
+                        <span className="text-[10px] text-gray-400 font-medium">({presets.length} presets ready)</span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                        {onRestoreDefaultPresets && (
+                            <button
+                                onClick={onRestoreDefaultPresets}
+                                className="px-2.5 py-1.5 bg-brand-secondary hover:bg-gray-700 text-gray-300 hover:text-white text-xs rounded-md transition-colors border border-gray-600"
+                                title="Reset preset library to the 8 curated studio defaults"
                             >
-                                Save
+                                Restore Studio Defaults
                             </button>
-                            <button 
-                                onClick={() => setShowSaveInput(false)}
-                                className="p-1.5 text-gray-400 hover:text-white transition-colors"
+                        )}
+                        {onSaveAsWorkspaceDefaults && (
+                            <button
+                                onClick={onSaveAsWorkspaceDefaults}
+                                className="px-2.5 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5"
+                                title="Save current camera presets and settings as workspace default"
                             >
-                                <CloseIcon className="w-4 h-4" />
+                                ★ Save As Default
                             </button>
-                        </div>
-                    )}
+                        )}
+                        {!showSaveInput ? (
+                            <button 
+                                onClick={() => setShowSaveInput(true)}
+                                className="flex items-center gap-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-md transition-colors shadow-sm"
+                            >
+                                <SparklesIcon className="w-3.5 h-3.5" />
+                                Save Current as Preset
+                            </button>
+                        ) : (
+                            <div className="flex items-center gap-2">
+                                <input 
+                                    type="text"
+                                    value={presetName}
+                                    onChange={(e) => setPresetName(e.target.value)}
+                                    placeholder="Preset name..."
+                                    className="px-3 py-1.5 bg-brand-secondary border border-gray-600 rounded-md text-xs focus:ring-1 focus:ring-brand-accent focus:border-brand-accent outline-none"
+                                    autoFocus
+                                    onKeyDown={(e) => e.key === 'Enter' && handleSave()}
+                                />
+                                <button 
+                                    onClick={handleSave}
+                                    disabled={!presetName.trim()}
+                                    className="px-3 py-1.5 bg-brand-accent text-brand-primary text-xs font-bold rounded-md hover:bg-indigo-400 disabled:bg-gray-500 disabled:cursor-not-allowed transition-colors"
+                                >
+                                    Save
+                                </button>
+                                <button 
+                                    onClick={() => setShowSaveInput(false)}
+                                    className="p-1.5 text-gray-400 hover:text-white transition-colors"
+                                >
+                                    <CloseIcon className="w-4 h-4" />
+                                </button>
+                            </div>
+                        )}
+                    </div>
                 </div>
 
                 {presets.length > 0 ? (
@@ -101,7 +129,8 @@ export const CameraSettings: React.FC<CameraSettingsProps> = ({
                             <div key={preset.id} className="group relative flex items-center">
                                 <button
                                     onClick={() => onApplyPreset(preset)}
-                                    className="px-3 py-1.5 bg-brand-secondary border border-gray-600 rounded-md text-xs hover:border-brand-accent hover:text-brand-accent transition-all"
+                                    className="px-3 py-1.5 bg-brand-secondary border border-gray-600 rounded-md text-xs hover:border-brand-accent hover:text-brand-accent transition-all font-medium text-gray-200"
+                                    title={`Apply "${preset.name}" preset`}
                                 >
                                     {preset.name}
                                 </button>
@@ -123,6 +152,7 @@ export const CameraSettings: React.FC<CameraSettingsProps> = ({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <SelectInput label="Camera Type" value={settings.cameraType} onChange={handleChange('cameraType')}>
                     <option value="">Default</option>
+                    <option value="Early 2000s MiniDV camcorder (Sony DCR-VX1000/Canon GL2 style, 480i digital video tape aesthetic, CCD sensor colors, authentic nostalgic handheld camcorder footage)">Early 2000s MiniDV Camcorder</option>
                     <option value="Professional DSLR camera">DSLR</option>
                     <option value="High-end cinematic film camera">Cinematic Film</option>
                     <option value="Vintage Polaroid camera with classic film stock">Vintage Polaroid</option>
@@ -190,6 +220,7 @@ export const CameraSettings: React.FC<CameraSettingsProps> = ({
                 </SelectInput>
                  <SelectInput label="Techniques" value={settings.technique} onChange={handleChange('technique')}>
                     <option value="">Default</option>
+                    <option value="filmed with early 2000s MiniDV camcorder handheld tracking movement, subtle natural jitter, authentic digital tape recording texture">MiniDV Camcorder Handheld</option>
                     <option value="shot with a strong bokeh effect, creating a beautifully blurred background">Bokeh Effect</option>
                     <option value="using a long exposure technique to capture light trails or smooth water">Long Exposure</option>
                     <option value="using intentional motion blur to convey speed and movement">Motion Blur</option>
@@ -198,6 +229,7 @@ export const CameraSettings: React.FC<CameraSettingsProps> = ({
                 </SelectInput>
                 <SelectInput label="Lens Effects / Distortion" value={settings.distortion} onChange={handleChange('distortion')}>
                     <option value="">Default</option>
+                    <option value="early 2000s MiniDV tape artifacts, subtle interlaced scan lines, tape noise, digital compression grain, glowing highlights">MiniDV Tape &amp; Interlace Artifacts</option>
                     <option value="captured with a modern, pristine lens with no distortion">Pristine (No Distortion)</option>
                     <option value="with subtle, cinematic lens flare">Subtle Lens Flare</option>
                     <option value="with vintage lens characteristics, including barrel distortion and chromatic aberration">Vintage Distortion</option>

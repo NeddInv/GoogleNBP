@@ -62,3 +62,23 @@ export const removeItem = async (key: string): Promise<void> => {
     request.onerror = () => reject(request.error);
   });
 };
+
+/**
+ * Completely clears all stored items in IndexedDB.
+ */
+export const clearEntireDatabase = async (): Promise<void> => {
+  try {
+    const db = await initDB();
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.clear();
+
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error('[storageService] Failed to clear IndexedDB:', err);
+  }
+};
+

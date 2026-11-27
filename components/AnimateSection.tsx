@@ -13,7 +13,7 @@ interface AnimateSectionProps {
     disabled: boolean;
 }
 
-const CAMERA_TYPES = ['Arri Alexa', 'Red V-Raptor', 'Sony Venice 2', 'Panavision Millennium XL2', 'GoPro Hero 12', 'DJI Mavic 3 Pro', 'iPhone 15 Pro', 'Smartphone/UGC', 'Vintage 16mm Camera', 'Super 8mm'];
+const CAMERA_TYPES = ['Arri Alexa', 'Red V-Raptor', 'Sony Venice 2', 'Panavision Millennium XL2', 'Early 2000s MiniDV Camcorder', 'GoPro Hero 12', 'DJI Mavic 3 Pro', 'iPhone 15 Pro', 'Smartphone/UGC', 'Vintage 16mm Camera', 'Super 8mm'];
 const TECHNIQUES = ['Slow Motion', 'Time-lapse', 'Hyper-lapse', 'Dolly Zoom', 'Handheld', 'Steadicam', 'Crane Shot', 'Drone Shot', 'POV', 'Macro'];
 const LIGHTING = ['Cinematic', 'Golden Hour', 'Blue Hour', 'High Key', 'Low Key', 'Neon', 'Softbox', 'Natural Light', 'Studio Lighting', 'Volumetric Lighting'];
 const DURATIONS = ['5s', '10s'];

@@ -2,10 +2,39 @@
 <!DOCTYPE html>
 <html lang="en">
   <head>
+    <script>
+      // Provide both getter and setter for window.fetch so iframe host harnesses and extensions
+      // can wrap fetch without triggering 'Cannot set property fetch of #<Window> which has only a getter'
+      (function() {
+        try {
+          var _origFetch = window.fetch;
+          Object.defineProperty(window, 'fetch', {
+            get: function() {
+              return _origFetch;
+            },
+            set: function(fn) {
+              _origFetch = fn;
+            },
+            configurable: true,
+            enumerable: true
+          });
+        } catch (e) {}
+
+        window.addEventListener('error', function(e) {
+          if (e && e.message && e.message.indexOf('fetch of #<Window>') !== -1) {
+            e.preventDefault();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Product Ad Generator</title>
+    <title>AI Product Ad Generator & Image Generator WITH CAMERA SETTINGS and mood</title>
+    <meta name="description" content="Generate professional, real-world product advertisements by providing a product image, selecting a background, and adding a slogan. The app uses AI to create compelling ad visuals for various scenarios." />
+    <meta property="og:title" content="AI Product Ad Generator & Image Generator WITH CAMERA SETTINGS and mood" />
+    <meta property="og:description" content="Generate professional, real-world product advertisements by providing a product image, selecting a background, and adding a slogan. The app uses AI to create compelling ad visuals for various scenarios." />
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -31,18 +60,8 @@
         }
       }
     </script>
-  <script type="importmap">
-{
-  "imports": {
-    "react": "https://aistudiocdn.com/react@^19.1.1",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.1.1/",
-    "react/": "https://aistudiocdn.com/react@^19.1.1/",
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.17.0"
-  }
-}
-</script>
-<link rel="stylesheet" href="/index.css">
-</head>
+    <link rel="stylesheet" href="/index.css">
+  </head>
   <body class="bg-brand-primary">
     <div id="root"></div>
     <script type="module" src="/index.tsx"></script>

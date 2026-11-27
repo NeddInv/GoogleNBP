@@ -2,6 +2,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { ImageData } from '../types';
 import { UploadIcon, CloseIcon } from './icons';
+import { processImageFile, isHeicImage } from '../utils/heicConverter';
 
 interface ImageUploaderProps {
     id: string;
@@ -12,13 +13,19 @@ interface ImageUploaderProps {
     multiple?: boolean;
 }
 
-const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => resolve((reader.result as string).split(',')[1]);
-        reader.onerror = error => reject(error);
-    });
+const isSupportedImageType = (file: File): boolean => {
+    if (isHeicImage(file)) return true;
+    const type = (file.type || '').toLowerCase();
+    const name = file.name.toLowerCase();
+    return (
+        ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif', 'image/svg+xml'].includes(type) ||
+        name.endsWith('.png') ||
+        name.endsWith('.jpg') ||
+        name.endsWith('.jpeg') ||
+        name.endsWith('.webp') ||
+        name.endsWith('.heic') ||
+        name.endsWith('.heif')
+    );
 };
 
 export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImageUpload, onImagesUpload, initialImage, multiple }) => {
@@ -26,6 +33,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
     const [fileName, setFileName] = useState<string | null>(null);
     const [isDragging, setIsDragging] = useState(false);
     const [isProcessing, setIsProcessing] = useState(false);
+    const [processingStatus, setProcessingStatus] = useState<string>('Processing...');
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     // Sync preview if initialImage changes (e.g., reset)
@@ -35,6 +43,9 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
             setFileName(null);
         } else {
             setPreview(`data:${initialImage.mimeType};base64,${initialImage.base64}`);
+            if (initialImage.name) {
+                setFileName(initialImage.name);
+            }
         }
     }, [initialImage]);
 
@@ -45,19 +56,25 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
                 const newImages: ImageData[] = [];
                 for (let i = 0; i < files.length; i++) {
                     const file = files[i];
-                    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
-                        alert(`File ${file.name} is not a supported image type (PNG, JPG, WEBP).`);
+                    if (!isSupportedImageType(file)) {
+                        alert(`File ${file.name} is not a supported image type (PNG, JPG, WEBP, HEIC).`);
                         continue;
                     }
-                    if (file.size > 12 * 1024 * 1024) {
-                        alert(`File ${file.name} exceeds 12MB limit.`);
+                    if (file.size > 25 * 1024 * 1024) {
+                        alert(`File ${file.name} exceeds 25MB limit.`);
                         continue;
                     }
                     try {
-                        const base64 = await fileToBase64(file);
-                        newImages.push({ base64, mimeType: file.type });
+                        if (isHeicImage(file)) {
+                            setProcessingStatus(`Converting HEIC ${file.name}...`);
+                        } else {
+                            setProcessingStatus('Processing...');
+                        }
+                        const { base64, mimeType } = await processImageFile(file);
+                        newImages.push({ base64, mimeType, name: file.name });
                     } catch (error) {
                         console.error('Error converting file to base64:', error);
+                        alert(`Could not process image "${file.name}".`);
                     }
                 }
                 if (newImages.length > 0) {
@@ -67,22 +84,28 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
             } else {
                 const file = files[0];
                 if (file) {
-                    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
-                        alert(`File ${file.name} is not a supported image type (PNG, JPG, WEBP).`);
+                    if (!isSupportedImageType(file)) {
+                        alert(`File ${file.name} is not a supported image type (PNG, JPG, WEBP, HEIC).`);
                         return;
                     }
                     try {
-                        if(file.size > 12 * 1024 * 1024) {
-                            alert("File size exceeds 12MB limit.");
+                        if (file.size > 25 * 1024 * 1024) {
+                            alert("File size exceeds 25MB limit.");
                             return;
                         }
-                        const base64 = await fileToBase64(file);
-                        const imageData: ImageData = { base64, mimeType: file.type };
+                        if (isHeicImage(file)) {
+                            setProcessingStatus('Converting HEIC image...');
+                        } else {
+                            setProcessingStatus('Processing image...');
+                        }
+                        const { file: processedFile, base64, mimeType } = await processImageFile(file);
+                        const imageData: ImageData = { base64, mimeType, name: file.name };
                         onImageUpload(imageData);
-                        setPreview(URL.createObjectURL(file));
+                        setPreview(URL.createObjectURL(processedFile));
                         setFileName(file.name);
                     } catch (error) {
                         console.error('Error converting file to base64:', error);
+                        alert(`Failed to load "${file.name}". Please ensure it is a valid image.`);
                         onImageUpload(null);
                         setPreview(null);
                         setFileName(null);
@@ -91,6 +114,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
             }
         } finally {
             setIsProcessing(false);
+            setProcessingStatus('Processing...');
         }
     }, [multiple, onImagesUpload, onImageUpload]);
 
@@ -165,13 +189,13 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
                 ) : isProcessing ? (
                     <div className="flex flex-col items-center justify-center p-4 text-center">
                         <div className="w-8 h-8 border-4 border-brand-accent border-t-transparent rounded-full animate-spin mb-2"></div>
-                        <p className="text-xs text-gray-400">Processing...</p>
+                        <p className="text-xs text-gray-300 font-medium">{processingStatus}</p>
                     </div>
                 ) : (
                     <div className="flex flex-col items-center justify-center p-4 text-center">
                         <UploadIcon className="w-8 h-8 mb-2 text-gray-400" />
                         <p className="mb-1 text-xs text-gray-400"><span className="font-semibold">Click or drag to upload</span></p>
-                        <p className="text-[10px] text-gray-500">PNG, JPG, WEBP (MAX. 12MB)</p>
+                        <p className="text-[10px] text-gray-500">PNG, JPG, WEBP, HEIC (MAX. 25MB)</p>
                         {multiple && <p className="mt-1 text-[10px] text-brand-accent font-bold">Multiple allowed</p>}
                     </div>
                 )}
@@ -181,7 +205,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ id, label, onImage
                     type="file" 
                     className="hidden" 
                     onChange={handleFileChange} 
-                    accept="image/png, image/jpeg, image/webp" 
+                    accept="image/png, image/jpeg, image/webp, image/heic, image/heif, .heic, .heif" 
                     multiple={multiple}
                 />
             </div>

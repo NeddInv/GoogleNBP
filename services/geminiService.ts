@@ -1,68 +1,78 @@
+import type { 
+    GenerateAdParams, 
+    ImageData, 
+    PanDirection, 
+    ZoomDirection, 
+    VaryStrength, 
+    ZoomLevel, 
+    AspectRatio, 
+    ImageSize, 
+    VideoSettingsData, 
+    VideoModel, 
+    AdVariation, 
+    GenerationError, 
+    ImageGenerationResponse, 
+    InsertModelParams, 
+    ModelType,
+    CharacterProfile
+} from '../types';
+import {
+    loadCharacterProfiles,
+    detectActiveCharacters,
+    generateCharacterDirectives,
+    generateCharacterNegativeTerms,
+    parseCharacterSwapPrompt,
+    type ParsedSwapIntent
+} from './characterService';
 
-import { GoogleGenAI, Type, Modality, GenerateContentResponse } from "@google/genai";
-import type { GenerateAdParams, ImageData, PanDirection, ZoomDirection, VaryStrength, ZoomLevel, AspectRatio, ImageSize, VideoSettingsData, VideoModel, AdVariation, GenerationError, ImageGenerationResponse } from '../types';
-
-// Create a new instance for every call to ensure we use the latest API key (e.g. after user selection)
-const getAIClient = () => {
-    const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        throw new Error("Gemini API key is not set. Please select an API key if using Pro/Ultra models.");
-    }
-    return new GoogleGenAI({ apiKey });
-};
-
-const createAbortPromise = <T>(signal: AbortSignal): Promise<T> => {
-    return new Promise<T>((_, reject) => {
-        signal.addEventListener('abort', () => {
-            const error = new Error("Generation cancelled by user.");
-            error.name = "AbortError";
-            reject(error);
-        });
-    });
-};
-
-const dataUrlToImageData = (dataUrl: string): ImageData => {
+const dataUrlToImageData = (dataUrl: string, name?: string): ImageData => {
     const [header, base64] = dataUrl.split(',');
     const mimeType = header.match(/:(.*?);/)?.[1] || 'image/jpeg';
-    return { base64, mimeType };
+    return { base64, mimeType, name };
 };
 
 /**
  * Resizes a base64 image to a maximum dimension while maintaining aspect ratio.
- * This ensures we don't exceed Gemini API payload limits (approx 20MB total).
+ * This ensures we don't exceed API payload limits while retaining crisp resolution.
  */
-const resizeImage = async (imageData: ImageData, maxDimension: number = 1536): Promise<ImageData> => {
+const resizeImage = async (imageData: ImageData, maxDimension: number = 1536, preserveCrispQuality: boolean = false): Promise<ImageData> => {
     return new Promise((resolve) => {
         const img = new Image();
         img.src = `data:${imageData.mimeType};base64,${imageData.base64}`;
         img.onload = () => {
             const { width, height } = img;
-            if (width <= maxDimension && height <= maxDimension && imageData.mimeType === 'image/webp') {
+            // Preserve original crisp image (PNG/WebP/JPEG) without lossy re-compression when already within bounds
+            if (width <= maxDimension && height <= maxDimension && (preserveCrispQuality || imageData.mimeType === 'image/webp' || imageData.mimeType === 'image/png')) {
                 resolve(imageData);
                 return;
             }
 
-            let newWidth, newHeight;
+            let newWidth: number;
+            let newHeight: number;
             if (width > height) {
-                newWidth = maxDimension;
-                newHeight = (height * maxDimension) / width;
+                newWidth = Math.min(width, maxDimension);
+                newHeight = (height * newWidth) / width;
             } else {
-                newHeight = maxDimension;
-                newWidth = (width * maxDimension) / height;
+                newHeight = Math.min(height, maxDimension);
+                newWidth = (width * newHeight) / height;
             }
 
             const canvas = document.createElement('canvas');
-            canvas.width = newWidth;
-            canvas.height = newHeight;
+            canvas.width = Math.max(1, Math.round(newWidth));
+            canvas.height = Math.max(1, Math.round(newHeight));
             const ctx = canvas.getContext('2d');
             if (!ctx) {
                 resolve(imageData);
                 return;
             }
 
-            ctx.drawImage(img, 0, 0, newWidth, newHeight);
-            const resizedDataUrl = canvas.toDataURL('image/webp', 0.85);
-            resolve(dataUrlToImageData(resizedDataUrl));
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            const targetMime = preserveCrispQuality && imageData.mimeType === 'image/png' ? 'image/png' : 'image/webp';
+            const quality = preserveCrispQuality ? 0.95 : 0.9;
+            const resizedDataUrl = canvas.toDataURL(targetMime, quality);
+            resolve(dataUrlToImageData(resizedDataUrl, imageData.name));
         };
         img.onerror = () => resolve(imageData);
     });
@@ -96,11 +106,10 @@ const convertToWebP = async (dataUrl: string): Promise<string> => {
 };
 
 /**
- * Maps our extended AspectRatio type to the strict set supported by the Gemini API imageConfig.
+ * Maps extended AspectRatio type to standard ratio values for API compatibility.
  */
 const mapToApiAspectRatio = (ratio: AspectRatio | undefined): "1:1" | "9:16" | "16:9" | "4:3" | "3:4" | "1:4" | "1:8" | "4:1" | "8:1" => {
     if (!ratio) return "1:1";
-    // For 3.1 Flash Image, try to use the closest standard ratio
     if (ratio === '97:60' || ratio === '16:10' || ratio === '2:1' || ratio === '12:5' || ratio === '36:13' || ratio === '1.91:1') return "16:9";
     if (ratio === '3:2' || ratio === '1.2:1') return "4:3";
     if (ratio === '4:5' || ratio === '1:2') return "3:4";
@@ -140,27 +149,27 @@ const ASPECT_RATIO_VALUES: Record<AspectRatio, number> = {
 };
 
 const cropImageToAspectRatio = (base64Image: string, targetAspectRatio: number, forceWidth?: number, forceHeight?: number): Promise<string> => {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         const img = new Image();
         img.src = base64Image;
         img.onload = () => {
             const currentRatio = img.width / img.height;
             
-            // If we have forced dimensions, we always use them
             const targetWidth = forceWidth || (currentRatio > targetAspectRatio ? img.height * targetAspectRatio : img.width);
             const targetHeight = forceHeight || (currentRatio > targetAspectRatio ? img.height : img.width / targetAspectRatio);
 
             const canvas = document.createElement('canvas');
-            let sourceWidth, sourceHeight, offsetX, offsetY;
+            let sourceWidth: number;
+            let sourceHeight: number;
+            let offsetX: number;
+            let offsetY: number;
 
             if (currentRatio > targetAspectRatio) {
-                // Image is wider than target ratio - crop from sides
                 sourceHeight = img.height;
                 sourceWidth = img.height * targetAspectRatio;
                 offsetX = (img.width - sourceWidth) / 2;
                 offsetY = 0;
             } else {
-                // Image is taller than target ratio - crop from top/bottom
                 sourceWidth = img.width;
                 sourceHeight = img.width / targetAspectRatio;
                 offsetX = 0;
@@ -185,118 +194,759 @@ const cropImageToAspectRatio = (base64Image: string, targetAspectRatio: number, 
 };
 
 /**
- * Maps our extended ImageSize type to the strict set supported by the Gemini API imageConfig.
- * Capped at 4K for API stability, using prompt engineering to handle 6K/8K requests.
+ * Maps ImageSize to API supported values.
  */
-const mapToApiImageSize = (size: ImageSize | undefined): "512px" | "1K" | "2K" | "4K" => {
-    if (!size) return "1K";
+const mapToApiImageSize = (size: ImageSize | undefined, model?: string): "512px" | "1K" | "2K" | "4K" => {
+    if (!size) return "2K";
+    if (size === '512px') {
+        if (model === 'gemini-3-pro-image' || !model) return "1K";
+        return "512px";
+    }
     if (size === '6K' || size === '8K') return "4K";
     return size as any;
 };
 
-export const generateSlogans = async (productName: string): Promise<string[]> => {
-    try {
-        const ai = getAIClient();
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: `Generate 5 creative, short, and catchy advertising slogans for a product named "${productName}".`,
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                        slogans: {
-                            type: Type.ARRAY,
-                            items: {
-                                type: Type.STRING,
-                            },
-                        },
-                    },
-                },
-            },
-        });
-        
-        const jsonText = response.text.trim();
-        const result = JSON.parse(jsonText);
-        return result.slogans || [];
-
-    } catch (error) {
-        console.error("Error generating slogans:", error);
-        throw new Error("Failed to communicate with the AI for slogan generation.");
-    }
+/**
+ * Strips terms that trigger Gemini safety classifiers.
+ */
+export const sanitizeNegativePrompt = (text: string): string => {
+    if (!text) return '';
+    const sensitiveTokens = /\b(extra limbs|bad anatomy|deformed|mutilated|disfigured|amputated|gross|ugly|grotesque|severed|bloody)\b/gi;
+    return text.replace(sensitiveTokens, '').replace(/,\s*,/g, ',').replace(/^,\s*|,\s*$/g, '').trim();
 };
-
-export const generateAdCopy = async (productName: string, slogan: string, sceneDescription: string): Promise<string> => {
-     try {
-        const ai = getAIClient();
-        const prompt = `
-            Generate a short, engaging paragraph of ad copy (2-3 sentences) for a product. The copy should be suitable for a social media post.
-            - Product: ${productName || 'our latest product'}
-            - Slogan: "${slogan}"
-            - Visuals: The ad visual depicts the following scene: ${sceneDescription}
-            Focus on creating an enticing and professional tone. Do not use hashtags.
-        `.trim().replace(/\s+/g, ' ');
-
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt,
-        });
-        
-        return response.text.trim();
-
-    } catch (error) {
-        console.error("Error generating ad copy:", error);
-        throw new Error("Failed to communicate with the AI for ad copy generation.");
-    }
-};
-
-export const generateSuggestions = async (currentPrompt: string): Promise<string[]> => {
-    try {
-        const ai = getAIClient();
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: `Based on the following ad description, provide 3 short, creative suggestions to make it more visually compelling or detailed. The suggestions should be things that can be added to the prompt.\n\nDescription: "${currentPrompt}"`,
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                        suggestions: {
-                            type: Type.ARRAY,
-                            items: {
-                                type: Type.STRING,
-                                description: "A short suggestion to enhance the ad prompt."
-                            },
-                        },
-                    },
-                },
-            },
-        });
-        
-        const jsonText = response.text.trim();
-        const result = JSON.parse(jsonText);
-        return result.suggestions || [];
-
-    } catch (error) {
-        console.error("Error generating suggestions:", error);
-        throw new Error("Failed to communicate with the AI for suggestions.");
-    }
-};
-
 
 /**
- * Detects if a prompt is comprehensive enough to bypass guided presets (Style, Mood, Slogan, etc.)
+ * Sanitizes prompt for safe fallback retry.
  */
-const checkIsComprehensive = (text: string): boolean => {
-    if (!text) return false;
-    const comprehensiveKeywords = [
-        'SHOT TYPE', 'LIGHTING', 'PRODUCT', 'SKIN', 'PHOTOGRAPHY', 
-        'ENVIRONMENT', 'CLOTHING', 'CAMERA', 'TONE', 'SCENE DEFINITION'
-    ];
-    const hasKeywords = comprehensiveKeywords.some(keyword => text.toUpperCase().includes(keyword));
-    return text.length > 250 || hasKeywords;
+export const sanitizePromptForSafety = (text: string): string => {
+    if (!text) return '';
+    return sanitizeNegativePrompt(text)
+        .replace(/Strict Exclusion:[^\n]*/gi, '')
+        .replace(/Important Exclusion:[^\n]*/gi, '')
+        .replace(/MODEL PROP EXCLUSION:[^\n]*/gi, '')
+        .replace(/MODEL STYLING NOTE:[^\n]*/gi, '')
+        .replace(/Transfer ONLY [^\n]*/gi, '')
+        .replace(/extract ONLY [^\n]*/gi, '')
+        .trim();
 };
 
+/**
+ * Resolves the official Gemini image generation model identifier for a given ModelType.
+ * Defaults to 'gemini-3-pro-image' to provide PRO levels of quality at all times.
+ */
+export const resolveImageModelName = (modelType?: ModelType | string): string => {
+    switch (modelType) {
+        case 'nano-banana-2.1':
+        case 'banana21':
+        case 'gemini-3.6-flash-image':
+        case 'gemini-nano-banana-2.1':
+            return 'gemini-nano-banana-2.1';
+        case 'ultra':
+        case 'light':
+        case 'standard':
+            return 'gemini-3.1-flash-lite-image';
+        case 'pro':
+        default:
+            return 'gemini-3-pro-image';
+    }
+};
+
+export const getCustomApiKey = (): string | null => {
+    try {
+        return localStorage.getItem('gemini_custom_api_key');
+    } catch {
+        return null;
+    }
+};
+
+export const setCustomApiKey = (key: string): void => {
+    try {
+        if (!key || !key.trim()) {
+            localStorage.removeItem('gemini_custom_api_key');
+        } else {
+            localStorage.setItem('gemini_custom_api_key', key.trim());
+        }
+    } catch {
+        // ignore storage errors
+    }
+};
+
+export const getAuthHeaders = (): Record<string, string> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const key = getCustomApiKey();
+    if (key) {
+        headers["x-gemini-api-key"] = key;
+    }
+    return headers;
+};
+
+/**
+ * Streams ad copy generation via server-side Server-Sent Events.
+ */
+export async function* generateAdCopyStream(
+    productName: string, 
+    slogan: string, 
+    sceneDescription: string, 
+    photoNames?: string[]
+): AsyncGenerator<string> {
+    const response = await fetch("/api/gemini/ad-copy", {
+        method: "POST",
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ productName, slogan, sceneDescription, photoNames, stream: true }),
+    });
+
+    if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Server responded with status ${response.status}`);
+    }
+
+    if (!response.body) {
+        throw new Error("No response body available for streaming");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (!dataStr) continue;
+            try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.error) {
+                    throw new Error(parsed.error);
+                }
+                if (parsed.chunk) {
+                    yield parsed.chunk;
+                }
+                if (parsed.done) {
+                    return;
+                }
+            } catch (e: any) {
+                if (e.message && e.message !== 'Unexpected end of JSON input') {
+                    throw e;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Generates slogans via server-side Gemini API.
+ */
+export const generateSlogans = async (productName: string): Promise<string[]> => {
+    try {
+        const response = await fetch("/api/gemini/slogans", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ productName }),
+        });
+
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `Server responded with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data.slogans || [];
+    } catch (error) {
+        console.error("Error generating slogans via server:", error);
+        throw new Error("Failed to communicate with the server for slogan generation.");
+    }
+};
+
+/**
+ * Generates ad copy via server-side Gemini API.
+ */
+export const generateAdCopy = async (
+    productName: string, 
+    slogan: string, 
+    sceneDescription: string, 
+    photoNames?: string[]
+): Promise<string> => {
+    try {
+        const response = await fetch("/api/gemini/ad-copy", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ productName, slogan, sceneDescription, photoNames }),
+        });
+
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `Server responded with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data.adCopy || '';
+    } catch (error) {
+        console.error("Error generating ad copy via server:", error);
+        throw new Error("Failed to communicate with the server for ad copy generation.");
+    }
+};
+
+/**
+ * Generates suggestions via server-side Gemini API.
+ */
+export const generateSuggestions = async (
+    currentPrompt: string, 
+    photoNames?: string[]
+): Promise<string[]> => {
+    try {
+        const response = await fetch("/api/gemini/suggestions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ currentPrompt, photoNames }),
+        });
+
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `Server responded with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data.suggestions || [];
+    } catch (error) {
+        console.error("Error generating suggestions via server:", error);
+        throw new Error("Failed to communicate with the server for suggestions.");
+    }
+};
+
+export interface ReferencePhotoEntry {
+    partIndex: number;
+    category: 'Product Design' | 'Competitor Comparison' | 'Model & Character' | 'Pose & Action' | 'Context & Scene' | 'Apparel & Gear' | 'Brand Logo';
+    name: string;
+    description: string;
+    imageData: ImageData;
+}
+
+/**
+ * Builds a structured reference catalog linking each uploaded image's exact file/photo name.
+ */
+export const buildPhotoReferenceCatalog = (params: {
+    productImage?: ImageData | null;
+    productImages?: ImageData[];
+    competitorImages?: ImageData[];
+    subjectImages?: ImageData[];
+    modelImages?: ImageData[];
+    poseImages?: ImageData[];
+    companyLogo?: ImageData | null;
+    productName?: string;
+}): { 
+    referenceEntries: ReferencePhotoEntry[]; 
+    catalogText: string; 
+    multimodalParts: { text?: string; inlineData?: { data: string; mimeType: string } }[];
+    productFileNames: string[];
+} => {
+    const entries: ReferencePhotoEntry[] = [];
+    let idx = 1;
+
+    // 1. Product Images
+    if (params.productImages && params.productImages.length > 0) {
+        params.productImages.slice(0, 10).forEach((img, i) => {
+            const fileName = img.name || `product_photo_${i + 1}.png`;
+            entries.push({
+                partIndex: idx++,
+                category: 'Product Design',
+                name: fileName,
+                description: `PRIMARY HERO PRODUCT REFERENCE #${i + 1} ("${fileName}"). Exact real product to advertise, showing physical form, container shape, label artwork, branding typography, materials, and colors.`,
+                imageData: img
+            });
+        });
+    } else if (params.productImage) {
+        const fileName = params.productImage.name || 'primary_product.png';
+        entries.push({
+            partIndex: idx++,
+            category: 'Product Design',
+            name: fileName,
+            description: `PRIMARY HERO PRODUCT REFERENCE ("${fileName}"). Exact real product to advertise, showing physical form, container shape, label artwork, branding typography, materials, and colors.`,
+            imageData: params.productImage
+        });
+    }
+
+    // 2. Competitor / Comparison Images
+    if (params.competitorImages && params.competitorImages.length > 0) {
+        params.competitorImages.slice(0, 12).forEach((img, i) => {
+            const fileName = img.name || `competitor_ref_${i + 1}.png`;
+            entries.push({
+                partIndex: idx++,
+                category: 'Competitor Comparison',
+                name: fileName,
+                description: `Competitor or benchmark product reference #${i + 1} ("${fileName}") for versus or comparative layouts.`,
+                imageData: img
+            });
+        });
+    }
+
+    // 3. Subject / Context Images (intelligently categorized: Apparel & Gear vs Character & Person vs Environment Scene)
+    const knownProfiles = loadCharacterProfiles();
+    if (params.subjectImages && params.subjectImages.length > 0) {
+        params.subjectImages.slice(0, 30).forEach((img, i) => {
+            const fileName = img.name || `context_scene_${i + 1}.png`;
+            const isApparelOrGear = /sleeve|knee|brace|apparel|gear|shoe|sneaker|wearable|strap|glove|shirt|pant|short|sock|jacket|hoodie|hat|cap|belt|vest|guard|accessory|prop|item|product/i.test(fileName);
+            const matchedProfile = knownProfiles.find(p => new RegExp(`\\b${p.name}\\b`, 'i').test(fileName));
+            const isCharacterOrPerson = !!matchedProfile || /joyce|rosa|marcus|model|character|person|woman|girl|man|boy|face|portrait|talent|actor|subject/i.test(fileName);
+
+            if (isCharacterOrPerson) {
+                const charIdentityDesc = matchedProfile
+                    ? `for character "${matchedProfile.name}" (${matchedProfile.ethnicity}${matchedProfile.genderAge ? `, ${matchedProfile.genderAge}` : ''} with ${matchedProfile.skinTone || 'authentic dark skin tone'})`
+                    : 'for real person/character ground truth';
+                entries.push({
+                    partIndex: idx++,
+                    category: 'Model & Character',
+                    name: fileName,
+                    description: `CHARACTER & MODEL REFERENCE PHOTO #${i + 1} ("${fileName}"). Real person/character ground truth ${charIdentityDesc}. CRITICAL DEMOGRAPHIC & ETHNICITY FIDELITY MANDATE: You MUST faithfully duplicate this exact character's ethnicity, racial identity (${matchedProfile?.ethnicity || 'authentic ethnic heritage'}), skin tone (${matchedProfile?.skinTone || 'melanin complexion, true-to-life skin tone'}), facial structure, eye shape, smile, and natural hair texture. Under NO circumstances whitewash, lighten, or alter this character's race.`,
+                    imageData: img
+                });
+            } else if (isApparelOrGear) {
+                entries.push({
+                    partIndex: idx++,
+                    category: 'Apparel & Gear',
+                    name: fileName,
+                    description: `EXACT PHYSICAL ITEM / APPAREL / GEAR REFERENCE #${i + 1} ("${fileName}"). Real physical wearable item, gear, or equipment. When this item is worn or depicted in the image, faithfully duplicate its exact physical structure, compression seams, elasticity bands, logo, typography, and fabric colorway with ZERO hallucination.`,
+                    imageData: img
+                });
+            } else {
+                entries.push({
+                    partIndex: idx++,
+                    category: 'Context & Scene',
+                    name: fileName,
+                    description: `Scene setting, environment background, surface material, or lifestyle context reference #${i + 1} ("${fileName}").`,
+                    imageData: img
+                });
+            }
+        });
+    }
+
+    // 4. Model / Character Images
+    if (params.modelImages && params.modelImages.length > 0) {
+        params.modelImages.slice(0, 20).forEach((img, i) => {
+            const fileName = img.name || `model_character_${i + 1}.png`;
+            const matchedProfile = knownProfiles.find(p => new RegExp(`\\b${p.name}\\b`, 'i').test(fileName));
+            const charIdentityDesc = matchedProfile
+                ? `for character "${matchedProfile.name}" (${matchedProfile.ethnicity}${matchedProfile.genderAge ? `, ${matchedProfile.genderAge}` : ''} with ${matchedProfile.skinTone || 'authentic dark skin tone'})`
+                : 'for real person/character ground truth';
+            entries.push({
+                partIndex: idx++,
+                category: 'Model & Character',
+                name: fileName,
+                description: `CHARACTER & MODEL REFERENCE #${i + 1} ("${fileName}"). Real person/model reference ${charIdentityDesc}. CRITICAL DEMOGRAPHIC & ETHNICITY FIDELITY MANDATE: You MUST faithfully duplicate this person's exact ethnicity, racial identity (${matchedProfile?.ethnicity || 'authentic ethnic heritage'}), skin tone (${matchedProfile?.skinTone || 'melanin complexion, true-to-life skin tone'}), facial structure, eye shape, smile, and natural hair texture. Under NO circumstances whitewash, lighten, or alter this character's race.`,
+                imageData: img
+            });
+        });
+    }
+
+
+    // 5. Pose Images
+    if (params.poseImages && params.poseImages.length > 0) {
+        params.poseImages.slice(0, 15).forEach((img, i) => {
+            const fileName = img.name || `pose_action_${i + 1}.png`;
+            entries.push({
+                partIndex: idx++,
+                category: 'Pose & Action',
+                name: fileName,
+                description: `Pose reference #${i + 1} ("${fileName}") showing body posture, hand positioning, and camera composition.`,
+                imageData: img
+            });
+        });
+    }
+
+    // 6. Company Logo
+    if (params.companyLogo) {
+        const fileName = params.companyLogo.name || 'brand_logo.png';
+        entries.push({
+            partIndex: idx++,
+            category: 'Brand Logo',
+            name: fileName,
+            description: `OFFICIAL BRAND LOGO REFERENCE ("${fileName}"). Replicate this authentic brand logo cleanly onto product packaging or clean overlay.`,
+            imageData: params.companyLogo
+        });
+    }
+
+    const productFileNames = entries
+        .filter(e => e.category === 'Product Design')
+        .map(e => e.name);
+
+    if (entries.length === 0) {
+        return {
+            referenceEntries: [],
+            catalogText: '',
+            multimodalParts: [],
+            productFileNames: []
+        };
+    }
+
+    const catalogHeader = [
+        '=== VISUAL REFERENCE PHOTO CATALOG & ZERO-HALLUCINATION DIRECTIVES ===',
+        'You have been provided with real uploaded photographic references corresponding to numbered image parts below.',
+        'MANDATORY RULES:',
+        '1. ZERO HALLUCINATION: For the advertised product, gear, apparel, and character references, faithfully duplicate the physical product form, geometry, branding typography, and colors from the designated product reference photos.',
+        '2. USE ALL REFERENCES: Every uploaded reference image in this catalog provides real visual ground truth for products, models, gear, props, and scenes. You MUST integrate and faithfully honor all provided references with zero hallucination.',
+        '3. PHOTO MAPPING: When a prompt mentions a photo by name (e.g., "[Attached File: ...]", "@photo.png", or "[Extra References: ...]"), locate that exact reference photo in this catalog and faithfully replicate it.',
+        '========================================================================'
+    ].join('\n');
+
+    const entryLines = entries.map(e => 
+        `• [Image Part ${e.partIndex}: "${e.name}" (${e.category})]: ${e.description}`
+    ).join('\n');
+
+    const catalogText = `${catalogHeader}\n\n${entryLines}\n========================================================================`;
+
+    const multimodalParts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = [];
+    entries.forEach(e => {
+        multimodalParts.push({
+            text: `[REFERENCE IMAGE PART #${e.partIndex}: "${e.name}" (${e.category})]\nRole & Instructions: ${e.description}`
+        });
+        multimodalParts.push({
+            inlineData: {
+                data: e.imageData.base64,
+                mimeType: e.imageData.mimeType
+            }
+        });
+    });
+
+    return {
+        referenceEntries: entries,
+        catalogText,
+        multimodalParts,
+        productFileNames
+    };
+};
+
+/**
+ * Exact-first photo matcher so similar filenames (e.g. product_1.png vs product_10.png or frame.png vs frame-03.png)
+ * NEVER hijack each other.
+ */
+const findBestPhotoEntry = (
+    rawToken: string,
+    entries: ReferencePhotoEntry[],
+    excludeNames?: Set<string>
+): ReferencePhotoEntry | undefined => {
+    const clean = rawToken.trim().replace(/^@/, '').replace(/^["'\[\]]+|["'\[\]]+$/g, '').trim();
+    if (!clean || !entries || entries.length === 0) return undefined;
+    const cleanLower = clean.toLowerCase();
+    const cleanBase = cleanLower.replace(/\.[^/.]+$/, '');
+    const pool = excludeNames
+        ? entries.filter(e => !excludeNames.has(e.name.toLowerCase()))
+        : entries;
+
+    // 1. Exact full filename match
+    const exactFull = pool.find(e => e.name.toLowerCase() === cleanLower);
+    if (exactFull) return exactFull;
+
+    // 2. Exact basename match (without extension)
+    const exactBase = pool.find(e => e.name.toLowerCase().replace(/\.[^/.]+$/, '') === cleanBase);
+    if (exactBase) return exactBase;
+
+    // 3. Entry name contains token (prefer closest/shortest match, require >= 4 chars)
+    if (cleanBase.length >= 4) {
+        const contains = pool
+            .filter(e => e.name.toLowerCase().includes(cleanBase))
+            .sort((a, b) => a.name.length - b.name.length);
+        if (contains.length > 0) return contains[0];
+    }
+
+    // 4. Token contains entry basename (prefer longest/most specific entry basename, require >= 4 chars)
+    const reverse = pool
+        .filter(e => {
+            const eb = e.name.toLowerCase().replace(/\.[^/.]+$/, '');
+            return eb.length >= 4 && cleanBase.includes(eb);
+        })
+        .sort((a, b) => b.name.length - a.name.length);
+    return reverse[0];
+};
+
+/**
+ * Extracts any reference photos explicitly @mentioned or tagged in the prompt text.
+ * Supports filenames with spaces, @filename.png, @filename, [Photo: filename], and exact filename occurrences.
+ */
+export const extractMentionedPhotoEntries = (
+    promptText: string,
+    entries: ReferencePhotoEntry[]
+): ReferencePhotoEntry[] => {
+    if (!promptText || !entries || entries.length === 0) return [];
+    const matched: ReferencePhotoEntry[] = [];
+    const seen = new Set<string>();
+    const promptLower = promptText.toLowerCase();
+
+    // 0. Longest-first direct @<exact name> match (supports filenames containing spaces!)
+    const sortedByNameLen = [...entries].sort((a, b) => b.name.length - a.name.length);
+    for (const e of sortedByNameLen) {
+        const eLower = e.name.toLowerCase();
+        const eBase = eLower.replace(/\.[^/.]+$/, '');
+        if (seen.has(eLower)) continue;
+        if (promptLower.includes(`@${eLower}`)) {
+            seen.add(eLower);
+            matched.push(e);
+        } else if (eBase.length >= 3 && new RegExp(`@${eBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s,.;:!?)'"\\]])`, 'i').test(promptText)) {
+            seen.add(eLower);
+            matched.push(e);
+        }
+    }
+
+    // 1. Matches for @filename or @name tokens
+    const atMatches = Array.from(promptText.matchAll(/@([a-zA-Z0-9_\-\.]+)/g));
+    for (const m of atMatches) {
+        const found = findBestPhotoEntry(m[1], entries, seen);
+        if (found) {
+            seen.add(found.name.toLowerCase());
+            matched.push(found);
+        }
+    }
+
+    // 2. Matches for [Photo: filename]
+    const photoTagMatches = Array.from(promptText.matchAll(/\[Photo:\s*([^\]]+)\]/gi));
+    for (const m of photoTagMatches) {
+        const found = findBestPhotoEntry(m[1], entries, seen);
+        if (found) {
+            seen.add(found.name.toLowerCase());
+            matched.push(found);
+        }
+    }
+
+    // 3. Exact full filename matches inside the prompt text (longest-first so product_10 matches before product_1)
+    for (const e of sortedByNameLen) {
+        const eLower = e.name.toLowerCase();
+        if (seen.has(eLower)) continue;
+        const eBase = eLower.replace(/\.[^/.]+$/, '');
+        if (eBase.length >= 3 && promptLower.includes(eLower)) {
+            seen.add(eLower);
+            matched.push(e);
+        }
+    }
+
+    return matched;
+};
+
+/**
+ * Executes a single image generation directly through the client-side Google AI Studio bridge.
+ * When running inside Google AI Studio, window.fetch to generativelanguage.googleapis.com is
+ * intercepted by the AI Studio iframe script (_aistudio-iframe.js) and forwarded with the user's
+ * linked paid API key (Nedd's Apps • ...SqTs).
+ */
+export const generateSingleImageViaAiStudioBridge = async (
+    item: {
+        index: number;
+        promptText: string;
+        promptTitle: string;
+        promptBoxIndex: number;
+        promptBoxNumber: number;
+        promptId: string;
+        fileName?: string;
+        referenceImages?: string[];
+        promptSnippet?: string;
+        itemMultimodalParts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }>;
+    },
+    primaryModel: string,
+    imageConfig: any,
+    fallbackMultimodalParts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }>,
+    signal?: AbortSignal
+): Promise<{
+    variantIndex: number;
+    id: string;
+    fileName?: string;
+    referenceImages?: string[];
+    modelUsed: string;
+    base64?: string;
+    mimeType?: string;
+    error?: any;
+}> => {
+    const modelUsed = primaryModel || 'gemini-3-pro-image';
+    const effectiveParts = (item.itemMultimodalParts && item.itemMultimodalParts.length > 0)
+        ? item.itemMultimodalParts
+        : fallbackMultimodalParts;
+
+    const buildPayload = (promptStr: string) => {
+        const parts: any[] = [];
+        for (const p of effectiveParts) {
+            if (p.inlineData && p.inlineData.data) {
+                parts.push({
+                    inlineData: {
+                        mimeType: p.inlineData.mimeType || 'image/jpeg',
+                        data: p.inlineData.data
+                    }
+                });
+            } else if (p.text) {
+                parts.push({ text: p.text });
+            }
+        }
+        parts.push({ text: promptStr });
+
+        const body: any = {
+            contents: [
+                {
+                    role: 'user',
+                    parts
+                }
+            ]
+        };
+
+        if (imageConfig && typeof imageConfig === 'object') {
+            body.generationConfig = {
+                imageConfig: {
+                    aspectRatio: imageConfig.aspectRatio || '1:1',
+                    ...(imageConfig.imageSize ? { imageSize: imageConfig.imageSize } : {})
+                }
+            };
+        }
+        return body;
+    };
+
+    const isFatalQuotaOrAuth = (errText: string): boolean => {
+        const lower = errText.toLowerCase();
+        return lower.includes('429') || 
+               lower.includes('quota') || 
+               lower.includes('resource_exhausted') || 
+               lower.includes('free tier') ||
+               lower.includes('limit: 0') ||
+               lower.includes('401') || 
+               lower.includes('403') || 
+               lower.includes('permission_denied') ||
+               lower.includes('unauthenticated');
+    };
+
+    const callApi = async (body: any): Promise<any> => {
+        const customKey = getCustomApiKey();
+        const keyParam = customKey ? `?key=${encodeURIComponent(customKey)}` : '';
+        const cleanModel = modelUsed.replace(/^models\//, '');
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent${keyParam}`;
+
+        const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'aistudio-build'
+        };
+        if (customKey) {
+            headers['x-goog-api-key'] = customKey;
+        }
+
+        const resp = await window.fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(body),
+            signal
+        });
+
+        if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            const errMessage = errData?.error?.message || `HTTP ${resp.status}: ${resp.statusText}`;
+            throw new Error(errMessage);
+        }
+
+        return await resp.json();
+    };
+
+    let responseData: any = null;
+    let lastError = '';
+
+    try {
+        responseData = await callApi(buildPayload(item.promptText));
+    } catch (err: any) {
+        lastError = err?.message || String(err);
+        console.warn(`[AI Studio Bridge Variation ${item.index + 1}] Primary call failed:`, err);
+    }
+
+    let candidate = responseData?.candidates?.[0];
+    let imagePart = candidate?.content?.parts?.find((p: any) => p.inlineData && p.inlineData.data);
+
+    // Safe Retry if blocked by safety review and not quota/auth
+    if (!imagePart && !isFatalQuotaOrAuth(lastError)) {
+        try {
+            const safePrompt = sanitizePromptForSafety(item.promptText);
+            const retryData = await callApi(buildPayload(safePrompt));
+            const retryCandidate = retryData?.candidates?.[0];
+            const retryImage = retryCandidate?.content?.parts?.find((p: any) => p.inlineData && p.inlineData.data);
+            if (retryImage) {
+                responseData = retryData;
+                candidate = retryCandidate;
+                imagePart = retryImage;
+                lastError = '';
+            }
+        } catch (retryErr: any) {
+            console.warn(`[AI Studio Bridge Variation ${item.index + 1}] Safe retry failed:`, retryErr);
+            if (!lastError) lastError = retryErr?.message || String(retryErr);
+        }
+    }
+
+    if (imagePart && imagePart.inlineData?.data) {
+        return {
+            variantIndex: item.index,
+            id: item.promptId,
+            fileName: item.fileName,
+            referenceImages: item.referenceImages,
+            modelUsed,
+            base64: imagePart.inlineData.data,
+            mimeType: imagePart.inlineData.mimeType || 'image/png'
+        };
+    }
+
+    const parseDetailedReason = (rawError?: string): string => {
+        if (!rawError) return `Unknown error occurred while generating ${item.promptTitle}.`;
+        const lower = rawError.toLowerCase();
+        if (lower.includes('api_key_invalid') || lower.includes('api key not valid')) {
+            return `Invalid API Key: Google did not recognize the provided API key. Check for missing characters or whitespace in your key.`;
+        }
+        if (lower.includes('permission_denied') || lower.includes('403')) {
+            return `Permission Denied (403): Ensure 'Generative Language API' is enabled in Google Cloud Console for this key's project, and that the key has no restrictive IP/referrer filters.`;
+        }
+        if (lower.includes('limit: 0') || lower.includes('free tier') || lower.includes('free_tier')) {
+            return `Free Tier Limit (0 Quota): This key belongs to a project without Billing enabled. Gemini image models require a paid billing project (Pay-As-You-Go).`;
+        }
+        if (lower.includes('429') || lower.includes('quota') || lower.includes('resource_exhausted')) {
+            return `Rate Limit Exceeded (429): Quota exhausted for ${modelUsed}. Wait 30 seconds or verify your quotas in Google Cloud Console.`;
+        }
+        if (lower.includes('timed out') || lower.includes('timeout') || lower.includes('aborted')) {
+            return `Generation timed out on ${item.promptTitle}. The model took too long to complete.`;
+        }
+        if (lower.includes('safety') || lower.includes('blocked') || lower.includes('harm')) {
+            return `Generation blocked by Gemini safety review on ${item.promptTitle}: "${rawError}". Adjust sensitive terms, exposure, or referenced imagery.`;
+        }
+        if (lower.includes('400') || lower.includes('invalid') || lower.includes('bad request')) {
+            return `Invalid request parameter or conflicting prompt settings (400 Bad Request) on ${item.promptTitle}: ${rawError}.`;
+        }
+        if (lower.includes('500') || lower.includes('503') || lower.includes('internal') || lower.includes('unavailable')) {
+            return `Gemini service temporarily unavailable (500/503) on ${item.promptTitle}. Please retry in a few moments.`;
+        }
+        return `Request failed on ${item.promptTitle}: ${rawError}`;
+    };
+
+    const blockReason = responseData?.promptFeedback?.blockReason;
+    const specificReason = blockReason 
+        ? `Generation blocked by Gemini safety review (${blockReason}) on ${item.promptTitle}.`
+        : parseDetailedReason(lastError);
+
+    return {
+        variantIndex: item.index,
+        id: item.promptId,
+        fileName: item.fileName,
+        referenceImages: item.referenceImages,
+        modelUsed,
+        error: {
+            message: `${item.promptTitle} failed: ${lastError || specificReason}`,
+            specificReason,
+            modelUsed,
+            promptBoxIndex: item.promptBoxIndex,
+            promptBoxNumber: item.promptBoxNumber,
+            promptTitle: item.promptTitle,
+            promptId: item.promptId,
+            fileName: item.fileName,
+            referenceImages: item.referenceImages,
+            promptSnippet: item.promptSnippet
+        }
+    };
+};
+
+/**
+ * Generates ad images using the server-side Gemini endpoint.
+ * Supports streaming progress updates and resilient retries.
+ */
 export const generateAdImage = async (
     params: GenerateAdParams, 
     signal: AbortSignal,
@@ -306,15 +956,11 @@ export const generateAdImage = async (
         productImage, productImages, competitorImages, subjectImages, modelImages, poseImages, companyLogo, productName, backgroundPrompt, slogan, 
         placement, fullPrompt, aspectRatio, negativePrompt, style, mood, numberOfVariations,
         cameraType, focalLength, aperture, shutterSpeed, lightingStyle, lightingSetup, distortion, textureDetail, colorStyle, technique, cameraAngle,
-        modelType, imageSize, promptMode
+        modelType = 'pro', imageSize = '2K', promptMode, promptBoxIndices, soloPromptIndex,
+        promptIds, promptFileNames, promptReferenceImages, globalReferenceImages, characters
     } = params;
 
-    const ai = getAIClient();
     const hasLogo = !!companyLogo;
-    const hasAnyImage = !!productImage || (productImages && productImages.length > 0) || (competitorImages && competitorImages.length > 0) || subjectImages.length > 0 || (modelImages && modelImages.length > 0) || (poseImages && poseImages.length > 0) || hasLogo;
-    const isPro = modelType === 'pro';
-    const isUltra = modelType === 'ultra';
-    const isLight = modelType === 'light';
     const multiplePrompts = Array.isArray(fullPrompt) ? fullPrompt : null;
     const variationsCount = multiplePrompts ? multiplePrompts.length : (numberOfVariations || 1);
 
@@ -332,479 +978,577 @@ export const generateAdImage = async (
         technique,
     ].filter(Boolean).join(', ');
 
+    if (signal.aborted) {
+        const error = new Error("Generation cancelled by user.");
+        error.name = "AbortError";
+        throw error;
+    }
 
-    try {
-        if (signal.aborted) {
-             const error = new Error("Generation cancelled by user.");
-             error.name = "AbortError";
-             throw error;
-        }
-        const abortPromise = createAbortPromise<never>(signal);
+    const totalImageCount = subjectImages.length + (productImages?.length || 0) + (competitorImages?.length || 0) + (modelImages?.length || 0) + (poseImages?.length || 0);
+    const secondaryDimension = totalImageCount > 15 ? 1024 : 1280;
 
-        // Resize images: if there is a massive batch of files, use a smaller dimension to remain efficient & prevent payload blocks
-        const count = subjectImages.length + (productImages?.length || 0) + (competitorImages?.length || 0) + (modelImages?.length || 0) + (poseImages?.length || 0);
-        const dimension = count > 12 ? 512 : (count > 5 ? 768 : 1536);
+    const resizedProductImage = productImage ? await resizeImage(productImage, 1536, true) : null;
+    const resizedProductImages = productImages ? await Promise.all(productImages.map(img => resizeImage(img, 1536, true))) : [];
+    const resizedLogo = companyLogo ? await resizeImage(companyLogo, 1536, true) : null;
+    const resizedModelImages = modelImages ? await Promise.all(modelImages.map(img => resizeImage(img, 1280, true))) : [];
+    const resizedPoseImages = poseImages ? await Promise.all(poseImages.map(img => resizeImage(img, 1024, false))) : [];
+    const resizedCompetitorImages = competitorImages ? await Promise.all(competitorImages.map(img => resizeImage(img, 1280, true))) : [];
+    const resizedSubjectImages = await Promise.all(subjectImages.map(img => resizeImage(img, secondaryDimension, true)));
 
-        const resizedProductImage = productImage ? await resizeImage(productImage, dimension) : null;
-        const resizedProductImages = productImages ? await Promise.all(productImages.map(img => resizeImage(img, dimension))) : [];
-        const resizedCompetitorImages = competitorImages ? await Promise.all(competitorImages.map(img => resizeImage(img, dimension))) : [];
-        const resizedSubjectImages = await Promise.all(subjectImages.map(img => resizeImage(img, dimension)));
-        const resizedModelImages = modelImages ? await Promise.all(modelImages.map(img => resizeImage(img, dimension))) : [];
-        const resizedPoseImages = poseImages ? await Promise.all(poseImages.map(img => resizeImage(img, dimension))) : [];
-        const resizedLogo = companyLogo ? await resizeImage(companyLogo, dimension) : null;
+    const { multimodalParts, referenceEntries } = buildPhotoReferenceCatalog({
+        productImage: resizedProductImage,
+        productImages: resizedProductImages,
+        competitorImages: resizedCompetitorImages,
+        subjectImages: resizedSubjectImages,
+        modelImages: resizedModelImages,
+        poseImages: resizedPoseImages,
+        companyLogo: resizedLogo,
+        productName
+    });
 
-        if (isPro || isUltra || isLight) {
-             const imageParts: { inlineData: { data: string, mimeType: string } }[] = [];
-             const imageDescriptions: string[] = [];
- 
-             if (resizedProductImages && resizedProductImages.length > 0) {
-                 resizedProductImages.slice(0, 10).forEach((img, i) => {
-                     imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                     imageDescriptions.push(`Product design reference image #${i + 1} showing details, shape, and angles.`);
-                 });
-             } else if (resizedProductImage) {
-                 imageParts.push({ inlineData: { data: resizedProductImage.base64, mimeType: resizedProductImage.mimeType } });
-                 imageDescriptions.push('The primary product image.');
-             }
-             if (resizedCompetitorImages && resizedCompetitorImages.length > 0) {
-                 resizedCompetitorImages.slice(0, 12).forEach((img, i) => {
-                     imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                     imageDescriptions.push(`Competitor/Comparison product image #${i + 1} for side-by-side or versus comparison.`);
-                 });
-             }
-             resizedSubjectImages.slice(0, 30).forEach((img, i) => {
-                 imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                 imageDescriptions.push(`A reference image for the subject, scene context, or environment to feature (#${i + 1}).`);
-             });
-             if (resizedModelImages && resizedModelImages.length > 0) {
-                 resizedModelImages.slice(0, 20).forEach((img, i) => {
-                     imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                     imageDescriptions.push(`Apparel/character/model reference image #${i + 1} for specific looks, expressions, fashion style, skin tone, or models.`);
-                 });
-             }
-             if (resizedPoseImages && resizedPoseImages.length > 0) {
-                 resizedPoseImages.slice(0, 15).forEach((img, i) => {
-                     imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                     imageDescriptions.push(`Pose & how-to-use reference image #${i + 1} showing exactly how the model should pose or interact with/use the product.`);
-                 });
-             }
-             if (resizedLogo) {
-                 imageParts.push({ inlineData: { data: resizedLogo.base64, mimeType: resizedLogo.mimeType } });
-                 imageDescriptions.push('The company logo.');
-             }
+    const primaryModel = resolveImageModelName(modelType);
+    const projectCharacters = (characters && characters.length > 0) ? characters : loadCharacterProfiles();
 
-             const getPromptForIndex = (index: number) => {
-                 let sceneDescription = '';
-                 
-                 // Strict mode separation
-                 if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
-                     sceneDescription = fullPrompt[index]?.trim() || `A professional commercial photograph of ${productName || 'the product'}. Variation ${index + 1}.`;
-                 } else if (promptMode === 'full' && typeof fullPrompt === 'string') {
-                     sceneDescription = fullPrompt.trim() || `A professional commercial photograph of ${productName || 'the product'}.`;
-                 } else {
-                     // Default to Guided Mode
-                     sceneDescription = `${placement || `A high-end shot of ${productName || 'the product'}`}. The background is ${backgroundPrompt}.`;
-                 }
+    const buildTargetedItem = (index: number) => {
+        const targetFileName = promptFileNames?.[index]?.trim() || '';
+        const promptRefs = promptReferenceImages?.[index] || [];
+        const allExtraRefs = Array.from(new Set([...promptRefs, ...(globalReferenceImages || [])].map(r => r.trim()).filter(Boolean)));
 
-                 const resolutionQualityNote = (imageSize === '6K' || imageSize === '8K') 
-                     ? `IMPORTANT: This is a high-resolution ${imageSize} render. Capture every micro-detail, skin texture, and fabric fiber. Ensure crisp focus.` 
-                     : '';
-
-                 // Detect if the user's prompt is comprehensive
-                 const isComprehensive = checkIsComprehensive(sceneDescription);
-
-                 const promptInstructions = [
-                     isComprehensive ? 'CRITICAL: FOLLOW THE DETAILED SCENE DEFINITION BELOW EXACTLY. IGNORE ALL OTHER UI PRESETS.' : 'TASK: Create a single, high-quality photorealistic advertisement image.',
-                     resolutionQualityNote,
-                     hasAnyImage ? `REFERENCE PRODUCT: Use the attached image for the PRODUCT DESIGN, TEXTURE, and SHAPE of the ${productName || 'product'}. IGNORE its background, lighting, and placement. Use ONLY the product itself.` : '',
-                     isComprehensive 
-                        ? `SCENE DEFINITION:\n${sceneDescription}`
-                        : `GOAL: Integrate the product into the following scene.\nSCENE DESCRIPTION: ${sceneDescription}`,
-                     !isComprehensive && aspectRatio === '97:60' ? 'LAYOUT: Amazon Product Infographic (970x600).' : '',
-                     !isComprehensive && style && style !== 'None' ? `STYLE: ${style}.` : '',
-                     !isComprehensive && mood && mood !== 'None' ? `MOOD: ${mood}.` : '',
-                     !isComprehensive && cameraDetails ? `CAMERA & LIGHTING: ${cameraDetails}.` : '',
-                     negativePrompt ? `STRICT EXCLUSION: ${negativePrompt}.` : '',
-                     !isComprehensive && hasLogo ? 'BRANDING: Place logo naturally.' : '',
-                     !isComprehensive && slogan ? `TEXT OVERLAY: Include "${slogan}" in a modern font.` : '',
-                     `VARIATION ID: ${index + 1}`
-                 ].filter(Boolean);
-
-                 const finalPromptArr = promptInstructions.join('\n');
-                 console.log(`[Variation ${index + 1} System Prompt]:`, finalPromptArr);
-                 return finalPromptArr;
-             };
-             
-             // Gemini 3 Pro / 3.1 Flash Request (Parallel for variations, with individual try-catch)
-             const singleCall = async (index: number): Promise<{ response?: GenerateContentResponse; error?: string }> => {
-                const timeoutPromise = new Promise<never>((_, reject) => {
-                    setTimeout(() => reject(new Error("Request timed out after 90 seconds.")), 90000);
-                });
-                const textPrompt = getPromptForIndex(index);
-                try {
-                    const response = await Promise.race([
-                        ai.models.generateContent({
-                            model: isUltra 
-                                ? 'gemini-3.1-flash-image-preview' 
-                                : isLight 
-                                    ? 'gemini-3.1-flash-lite-image-preview' 
-                                    : 'gemini-3-pro-image-preview',
-                            contents: { parts: [...imageParts, { text: textPrompt }] },
-                            config: {
-                                responseModalities: [Modality.IMAGE, Modality.TEXT],
-                                imageConfig: {
-                                    imageSize: mapToApiImageSize(imageSize),
-                                    aspectRatio: mapToApiAspectRatio(aspectRatio),
-                                }
-                            },
-                        }),
-                        timeoutPromise
-                    ]);
-                    return { response: response as GenerateContentResponse };
-                } catch (err: any) {
-                    console.error(`Error generating variation ${index + 1}:`, err);
-                    return { error: err?.message || `Failed to generate variation ${index + 1}` };
-                }
-             };
-
-             let activeIndices: number[] = [];
-             if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
-                 activeIndices = fullPrompt
-                     .map((p, idx) => (p && p.trim() !== '') ? idx : -1)
-                     .filter(idx => idx !== -1);
-                 if (activeIndices.length === 0) {
-                     activeIndices = [0];
-                 }
-             } else {
-                 activeIndices = Array.from({ length: variationsCount }).map((_, idx) => idx);
-             }
-
-             const results: { index: number; response?: GenerateContentResponse; error?: string }[] = [];
-             // Dynamic batch size: 2 if reference images are present (to avoid huge concurrent upload payloads), 4 if text-only
-             const BATCH_SIZE = hasAnyImage ? 2 : 4;
-             
-             const totalToGenerate = activeIndices.length;
-             for (let i = 0; i < totalToGenerate; i += BATCH_SIZE) {
-                 if (signal.aborted) {
-                      const error = new Error("Generation cancelled by user.");
-                      error.name = "AbortError";
-                      throw error;
-                 }
-                 const batchIndices = activeIndices.slice(i, i + BATCH_SIZE);
-                 
-                 if (onProgress) {
-                     onProgress(i, totalToGenerate);
-                 }
-
-                 const batchTasks = batchIndices.map(idx => 
-                     Promise.race([
-                         singleCall(idx).then(res => ({ index: idx, ...res })), 
-                         abortPromise
-                     ])
-                 );
-                 const batchResults = await Promise.all(batchTasks);
-                 results.push(...batchResults);
-             }
-             if (onProgress) {
-                 onProgress(totalToGenerate, totalToGenerate);
-             }
-
-             const images: AdVariation[] = [];
-             const errors: GenerationError[] = [];
-
-             results.forEach((result) => {
-                 const variantIndex = result.index; // Use the exact original prompt index
-                 if (result.error) {
-                     errors.push({ variantIndex, message: result.error });
-                     return;
-                 }
-
-                 const castedResponse = result.response as GenerateContentResponse;
-                 const candidate = castedResponse?.candidates?.[0];
-                 
-                 if (!candidate) {
-                     errors.push({ variantIndex, message: "No candidate in response." });
-                     return;
-                 }
-
-                 if (candidate.finishReason && candidate.finishReason !== 'STOP') {
-                     const finishMessage = `Stopped: ${candidate.finishReason}. ${candidate.safetyRatings?.map(r => `${r.category}: ${r.probability}`).join(', ') || ''}`;
-                     errors.push({ variantIndex, message: finishMessage });
-                 }
-                 
-                 let gotImage = false;
-                 if (candidate.content?.parts) {
-                     for (const part of candidate.content.parts) {
-                         if (part.inlineData) {
-                             images.push({
-                                 url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
-                                 variantIndex
-                             });
-                             gotImage = true;
-                             break; // Take the first image part for this variation
-                         } else if (part.text) {
-                             console.log(`Model response text for variation ${variantIndex}:`, part.text);
-                         }
-                     }
-                 }
-                 if (!gotImage && !result.error) {
-                     errors.push({ variantIndex, message: "Model response was missing image data." });
-                 }
-             });
-
-             if (images.length === 0) {
-                 const firstError = errors[0]?.message || "The model did not return any images. This may be due to safety filters or a complex prompt.";
-                 throw new Error(firstError);
-             }
-
-             const convertedImages = await Promise.all(
-                 images.map(async (img) => {
-                     let webpUrl = await convertToWebP(img.url);
-                     if (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) {
-                         const forceWidth = aspectRatio === '36:13' ? 1920 : undefined;
-                         const forceHeight = aspectRatio === '36:13' ? 693 : undefined;
-                         webpUrl = await cropImageToAspectRatio(webpUrl, ASPECT_RATIO_VALUES[aspectRatio], forceWidth, forceHeight);
-                     }
-                     return {
-                         url: webpUrl,
-                         variantIndex: img.variantIndex
-                     };
-                 })
-             );
-             
-             return {
-                 images: convertedImages,
-                 errors
-             };
-
+        let rawPrompt = '';
+        if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
+            rawPrompt = fullPrompt[index]?.trim() || `A professional commercial photograph of ${productName || 'the product'}.`;
+        } else if (promptMode === 'full' && typeof fullPrompt === 'string') {
+            rawPrompt = fullPrompt.trim() || `A professional commercial photograph of ${productName || 'the product'}.`;
         } else {
-            // Standard Model: Gemini 2.5 Flash Image (Nano Banana)
-            // Supports both text-to-image and image-to-image
-            const imageParts: { inlineData: { data: string, mimeType: string } }[] = [];
-            const imageDescriptions: string[] = [];
+            const rawPlacement = placement?.trim() || `A high-end commercial shot of ${productName || 'the product'}`;
+            const placementMentions = extractMentionedPhotoEntries(rawPlacement, referenceEntries);
+            const mentionsScenePhoto = placementMentions.some(m => m.category === 'Context & Scene');
+            const swapInPlacement = parseCharacterSwapPrompt(rawPlacement, referenceEntries);
+            const includeGuidedBg = !swapInPlacement && !mentionsScenePhoto && Boolean(backgroundPrompt);
+            const baseDescription = includeGuidedBg
+                ? `${rawPlacement}. The background is ${backgroundPrompt}.`
+                : rawPlacement;
+            const guidedParts = [
+                baseDescription,
+                aspectRatio === '97:60' ? 'Layout: Amazon Product Infographic (970x600).' : '',
+                style && style !== 'None' ? `Style: ${style}.` : '',
+                mood && mood !== 'None' ? `Mood: ${mood}.` : '',
+                cameraDetails ? `Camera & Lighting: ${cameraDetails}.` : '',
+                hasLogo ? 'Branding: Include the company logo cleanly.' : '',
+                slogan ? `Text Overlay: Include "${slogan}".` : '',
+            ].filter(Boolean);
+            rawPrompt = guidedParts.join('\n');
+        }
 
-            if (resizedProductImages && resizedProductImages.length > 0) {
-                resizedProductImages.slice(0, 10).forEach((img, i) => {
-                    imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                    imageDescriptions.push(`Product design reference image #${i + 1} showing details and shape.`);
-                });
-            } else if (resizedProductImage) {
-                imageParts.push({ inlineData: { data: resizedProductImage.base64, mimeType: resizedProductImage.mimeType } });
-                imageDescriptions.push('The primary product image.');
-            }
-            if (resizedCompetitorImages && resizedCompetitorImages.length > 0) {
-                resizedCompetitorImages.slice(0, 12).forEach((img, i) => {
-                    imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                    imageDescriptions.push(`Competitor/Comparison product image #${i + 1} for comparison/benchmark ads.`);
-                });
-            }
-            resizedSubjectImages.slice(0, 30).forEach((img, i) => {
-                imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                imageDescriptions.push(`A reference image for the subject (#${i + 1}).`);
+        const swapIntent = parseCharacterSwapPrompt(rawPrompt, referenceEntries);
+        const mentionedPhotos = extractMentionedPhotoEntries(rawPrompt, referenceEntries);
+        const attachedEntry = targetFileName ? findBestPhotoEntry(targetFileName, referenceEntries) : undefined;
+        const extraEntries = allExtraRefs
+            .map(refName => ({ refName, entry: findBestPhotoEntry(refName, referenceEntries) }));
+
+        // Determine whether this specific prompt explicitly targets specific reference photo(s)
+        const hasExplicitTargets = Boolean(swapIntent) || mentionedPhotos.length > 0 || Boolean(attachedEntry) || extraEntries.some(x => Boolean(x.entry));
+
+        // Build the EXACT, ordered list of images that will be attached to THIS prompt (1-based sequential numbering)
+        const itemMultimodalParts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = [];
+        const includedEntries: Array<{ seq: number; entry: ReferencePhotoEntry; roleLabel: string }> = [];
+        const usedNames = new Set<string>();
+        let seq = 1;
+
+        const pushImagePart = (entry: ReferencePhotoEntry, roleLabel: string, instructionText: string) => {
+            if (usedNames.has(entry.name.toLowerCase())) return;
+            usedNames.add(entry.name.toLowerCase());
+            const currentSeq = seq++;
+            includedEntries.push({ seq: currentSeq, entry, roleLabel });
+            itemMultimodalParts.push({
+                text: `[IMAGE #${currentSeq} — ${roleLabel}: "@${entry.name}"]\n${instructionText}`
             });
-            if (resizedModelImages && resizedModelImages.length > 0) {
-                resizedModelImages.slice(0, 20).forEach((img, i) => {
-                    imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                    imageDescriptions.push(`Character/model reference photo #${i + 1} for specific looks.`);
-                });
-            }
-            if (resizedPoseImages && resizedPoseImages.length > 0) {
-                resizedPoseImages.slice(0, 15).forEach((img, i) => {
-                    imageParts.push({ inlineData: { data: img.base64, mimeType: img.mimeType } });
-                    imageDescriptions.push(`Pose/how-to-use reference image #${i + 1} showing model pose and interaction with/use of the product.`);
-                });
-            }
-            if (resizedLogo) {
-                imageParts.push({ inlineData: { data: resizedLogo.base64, mimeType: resizedLogo.mimeType } });
-                imageDescriptions.push('The company logo.');
-            }
-            
-             const getPromptForIndex = (index: number) => {
-                 let sceneDescription = '';
-                 
-                 if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
-                     sceneDescription = fullPrompt[index]?.trim() || `A high-end advertisement for ${productName || 'the product'}. Variation ${index + 1}.`;
-                 } else if (promptMode === 'full' && typeof fullPrompt === 'string') {
-                     sceneDescription = fullPrompt.trim() || `A high-end advertisement for ${productName || 'the product'}.`;
-                 } else {
-                     sceneDescription = `${placement || 'An advertisement'}. Setting: ${backgroundPrompt}.`;
-                 }
-                 
-                 const isComprehensive = checkIsComprehensive(sceneDescription);
-
-                const promptInstructions = [
-                    isComprehensive ? 'CRITICAL: FOLLOW THE SCENE DESCRIPTION BELOW EXACTLY. IGNORE ALL OTHER UI PRESETS.' : 'Task: Create a single, photorealistic advertisement image.',
-                    hasAnyImage ? (isComprehensive ? 'Use the provided image strictly for product reference.' : 'Combine all provided images into one cohesive scene based on the description.') : '',
-                    !isComprehensive && aspectRatio === '97:60' ? 'Layout: Format as an Amazon Product Infographic (970x600). Ensure the product is central and sharp.' : '',
-                    isComprehensive ? `Scene Description:\n${sceneDescription}` : `Scene Description: ${sceneDescription}`,
-                    !isComprehensive && hasAnyImage ? 'Image Roles: ' + imageDescriptions.join(' ') : '',
-                ];
-                
-                if (!isComprehensive && style && style !== 'None') promptInstructions.push(`Artistic Style: ${style}.`);
-                if (!isComprehensive && mood && mood !== 'None') promptInstructions.push(`Overall Mood: ${mood}.`);
-                if (!isComprehensive && cameraDetails) promptInstructions.push(`Camera & Lighting Style: ${cameraDetails}.`);
-                if (negativePrompt) promptInstructions.push(`Important Exclusion: The image must NOT contain ${negativePrompt}.`);
-                if (!isComprehensive && hasLogo) promptInstructions.push('Logo Integration: Place the company logo tastefully.');
-                if (!isComprehensive && slogan) {
-                    promptInstructions.push(`Slogan: Add the text "${slogan}" to the image.`);
+            itemMultimodalParts.push({
+                inlineData: {
+                    data: entry.imageData.base64,
+                    mimeType: entry.imageData.mimeType
                 }
+            });
+        };
 
-                promptInstructions.push(isComprehensive ? 'Final Output: Follow the description exactly to create a realistic photograph.' : 'Final Output: The final image must be a single, photorealistic photograph.');
+        const getRoleAndInstructionForEntry = (entry: ReferencePhotoEntry, isHeroTarget: boolean): { roleLabel: string; instruction: string } => {
+            const matchedChar = projectCharacters.find(c => new RegExp(`\\b${c.name}\\b`, 'i').test(entry.name));
+            const isCharacter = entry.category === 'Model & Character' || !!matchedChar;
+            const isProduct = entry.category === 'Product Design' || entry.category === 'Apparel & Gear';
+            const isCompetitor = entry.category === 'Competitor Comparison';
+            const isLogo = entry.category === 'Brand Logo';
+            const isPose = entry.category === 'Pose & Action';
 
-                return promptInstructions.filter(Boolean).join('\n');
+            if (isProduct) {
+                return {
+                    roleLabel: isHeroTarget ? 'PRIMARY TARGET PRODUCT (EXACT GROUND TRUTH)' : 'PRODUCT / ITEM REFERENCE (EXACT GROUND TRUTH)',
+                    instruction: `EXACT PRODUCT REPLICATION MANDATE: Faithfully duplicate the EXACT physical product pictured in "@${entry.name}" with ZERO hallucination. Preserve its exact shape, proportions, packaging/container geometry, seams, materials, surface finish, colors, brand logo, and every visible word/letter of label typography identically. Do NOT invent a generic substitute or alter any packaging detail.`
+                };
+            }
+            if (isCompetitor) {
+                return {
+                    roleLabel: 'COMPARISON / BENCHMARK PRODUCT REFERENCE',
+                    instruction: `Faithfully replicate this exact comparison item from "@${entry.name}" only where requested for side-by-side or versus comparison.`
+                };
+            }
+            if (isCharacter) {
+                return {
+                    roleLabel: 'CHARACTER / MODEL REFERENCE',
+                    instruction: `Faithfully replicate this exact person's facial structure, ethnicity${matchedChar ? ` (${matchedChar.ethnicity})` : ''}, skin tone, hair texture, and likeness from "@${entry.name}" with zero whitewashing or race alteration.`
+                };
+            }
+            if (isPose) {
+                return {
+                    roleLabel: 'POSE & COMPOSITION REFERENCE',
+                    instruction: `Match the body posture, hand placement, and framing from "@${entry.name}" without copying unrelated products or backgrounds.`
+                };
+            }
+            if (isLogo) {
+                return {
+                    roleLabel: 'OFFICIAL BRAND LOGO',
+                    instruction: `Replicate this authentic brand logo cleanly onto the product or layout without distorting its letterforms or emblem.`
+                };
+            }
+            return {
+                roleLabel: isHeroTarget ? 'TARGET SCENE / PHOTO REFERENCE' : 'CONTEXT & SCENE REFERENCE',
+                instruction: `Use "@${entry.name}" as exact visual ground truth for the referenced scene, product, layout, environment, lighting, or subject exactly as described in the prompt.`
             };
-            
-            const singleCall = async (index: number): Promise<{ response?: GenerateContentResponse; error?: string }> => {
-                const timeoutPromise = new Promise<never>((_, reject) => {
-                    setTimeout(() => reject(new Error("Request timed out after 60 seconds.")), 60000);
-                });
-                const textPrompt = getPromptForIndex(index) + `\nVariation ID: ${index + 1}`;
-                
-                try {
-                    const response = await Promise.race([
-                        ai.models.generateContent({
-                            model: 'gemini-2.5-flash-image',
-                            contents: { parts: [...imageParts, { text: textPrompt }] },
-                            config: { 
-                                responseModalities: [Modality.IMAGE, Modality.TEXT],
-                                imageConfig: {
-                                    aspectRatio: mapToApiAspectRatio(aspectRatio),
-                                }
-                            },
-                        }),
-                        timeoutPromise
-                    ]);
-                    return { response: response as GenerateContentResponse };
-                } catch (err: any) {
-                    console.error(`Error generating variation ${index + 1}:`, err);
-                    return { error: err?.message || `Failed to generate variation ${index + 1}` };
-                }
-            };
+        };
 
-            let activeIndices: number[] = [];
-            if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
-                activeIndices = fullPrompt
-                    .map((p, idx) => (p && p.trim() !== '') ? idx : -1)
-                    .filter(idx => idx !== -1);
-                if (activeIndices.length === 0) {
-                    activeIndices = [0];
-                }
-            } else {
-                activeIndices = Array.from({ length: variationsCount }).map((_, idx) => idx);
-            }
-
-            const results: { index: number; response?: GenerateContentResponse; error?: string }[] = [];
-            // Dynamic batch size: 2 if reference images are present (to avoid huge concurrent upload payloads), 4 if text-only
-            const BATCH_SIZE = hasAnyImage ? 2 : 4;
-            
-            const totalToGenerate = activeIndices.length;
-            for (let i = 0; i < totalToGenerate; i += BATCH_SIZE) {
-                if (signal.aborted) {
-                     const error = new Error("Generation cancelled by user.");
-                     error.name = "AbortError";
-                     throw error;
-                }
-                const batchIndices = activeIndices.slice(i, i + BATCH_SIZE);
-                
-                if (onProgress) {
-                    onProgress(i, totalToGenerate);
-                }
-
-                const batchTasks = batchIndices.map(idx => 
-                    Promise.race([
-                        singleCall(idx).then(res => ({ index: idx, ...res })), 
-                        abortPromise
-                    ])
+        if (swapIntent) {
+            const { swapKind, targetSceneEntry, sourceSubjectEntry, targetSubjectDesc, sourceSubjectDesc } = swapIntent;
+            if (swapKind === 'object') {
+                pushImagePart(
+                    targetSceneEntry,
+                    'TARGET BASE SCENE PHOTO',
+                    `THIS IS THE BASE PHOTO TO EDIT. Keep 100% of the background, environment, lighting, shadows, framing, camera angle, and all other objects/people intact — ONLY remove "${targetSubjectDesc}" and place the exact product/item from IMAGE #2 in that position.`
                 );
-                const batchResults = await Promise.all(batchTasks);
-                results.push(...batchResults);
-            }
-            if (onProgress) {
-                onProgress(totalToGenerate, totalToGenerate);
+                pushImagePart(
+                    sourceSubjectEntry,
+                    'REPLACEMENT PRODUCT / OBJECT SOURCE (EXACT GROUND TRUTH)',
+                    `THIS IS THE EXACT PRODUCT ("${sourceSubjectDesc}") TO PLACE INTO IMAGE #1. Faithfully clone its exact physical geometry, proportions, label typography, brand logo, colors, seams, and surface texture with ZERO hallucination. STRICTLY DISCARD the background of "@${sourceSubjectEntry.name}".`
+                );
+            } else {
+                pushImagePart(
+                    targetSceneEntry,
+                    'TARGET BASE SCENE PHOTO',
+                    `THIS IS THE BASE PHOTO TO EDIT. Preserve 100% of its background, setting, camera angle, framing, lighting, shadows, props, and other people — ONLY remove "${targetSubjectDesc}" and replace them with the person from IMAGE #2.`
+                );
+                pushImagePart(
+                    sourceSubjectEntry,
+                    'REPLACEMENT CHARACTER SOURCE',
+                    `THIS IS THE NEW PERSON ("${sourceSubjectDesc}") TO INSERT INTO IMAGE #1. Copy their exact face, ethnicity, skin tone, hair texture, and likeness to replace "${targetSubjectDesc}" in IMAGE #1. STRICTLY DISCARD the background of "@${sourceSubjectEntry.name}".`
+                );
             }
 
-            const images: AdVariation[] = [];
-            const errors: GenerationError[] = [];
-
-            results.forEach((result) => {
-                const variantIndex = result.index; // Use the exact original prompt index
-                if (result.error) {
-                    errors.push({ variantIndex, message: result.error });
-                    return;
+            // Include any additional explicitly @mentioned photos (e.g., a 3rd product or prop)
+            mentionedPhotos.forEach(entry => {
+                const { roleLabel, instruction } = getRoleAndInstructionForEntry(entry, false);
+                pushImagePart(entry, roleLabel, instruction);
+            });
+            extraEntries.forEach(({ entry }) => {
+                if (entry) {
+                    const { roleLabel, instruction } = getRoleAndInstructionForEntry(entry, false);
+                    pushImagePart(entry, roleLabel, instruction);
                 }
+            });
+        } else if (hasExplicitTargets) {
+            // STRICT TARGET ISOLATION: Include ONLY the photos this prompt actually targets!
+            // This prevents unrelated uploaded products, competitors, or scenes from contaminating/hallucinating the target.
 
-                const castedResponse = result.response as GenerateContentResponse;
-                const candidate = castedResponse?.candidates?.[0];
-                if (candidate?.content?.parts) {
-                    let gotImage = false;
-                    for (const part of candidate.content.parts) {
-                        if (part.inlineData && part.inlineData.mimeType.startsWith('image/')) {
-                             images.push({
-                                 url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
-                                 variantIndex
-                             });
-                             gotImage = true;
-                             break;
+            // 1. Explicitly @mentioned photos in the prompt text (highest priority!)
+            mentionedPhotos.forEach((entry, idx) => {
+                const { roleLabel, instruction } = getRoleAndInstructionForEntry(entry, idx === 0 && !attachedEntry);
+                pushImagePart(entry, roleLabel, instruction);
+            });
+
+            // 2. Explicitly attached Hero/File reference for this prompt
+            if (attachedEntry) {
+                const { roleLabel, instruction } = getRoleAndInstructionForEntry(attachedEntry, true);
+                pushImagePart(attachedEntry, roleLabel, instruction);
+            }
+
+            // 3. Explicitly selected Extra References for this prompt
+            extraEntries.forEach(({ entry }) => {
+                if (entry) {
+                    const { roleLabel, instruction } = getRoleAndInstructionForEntry(entry, false);
+                    pushImagePart(entry, roleLabel, instruction);
+                }
+            });
+
+            // 4. Company logo if uploaded and prompt didn't exclude branding
+            const logoEntry = referenceEntries.find(e => e.category === 'Brand Logo');
+            if (logoEntry && hasLogo) {
+                const { roleLabel, instruction } = getRoleAndInstructionForEntry(logoEntry, false);
+                pushImagePart(logoEntry, roleLabel, instruction);
+            }
+        } else {
+            // No specific @mention or per-prompt file selected -> include all uploaded workspace references
+            referenceEntries.forEach((entry, idx) => {
+                const { roleLabel, instruction } = getRoleAndInstructionForEntry(entry, idx === 0 && entry.category === 'Product Design');
+                pushImagePart(entry, roleLabel, instruction);
+            });
+        }
+
+        // Detect character demographics ONLY for THIS prompt (never bleed characters from other prompt boxes!)
+        const corpusForCharDetection = [
+            rawPrompt,
+            targetFileName,
+            ...allExtraRefs
+        ];
+        const activeCharacters = detectActiveCharacters(corpusForCharDetection, projectCharacters);
+        const characterDemographicDirectives = generateCharacterDirectives(activeCharacters);
+
+        // Build clean, exact 1-to-1 reference index matching the EXACT images sent in itemMultimodalParts
+        let referenceBindingBlock = '';
+        if (includedEntries.length > 0 && !swapIntent) {
+            const lines = includedEntries.map(({ seq: imgNum, entry, roleLabel }) => {
+                const isProd = entry.category === 'Product Design' || entry.category === 'Apparel & Gear';
+                if (isProd) {
+                    return `• IMAGE #${imgNum} = "@${entry.name}" (${roleLabel}): STRICT ZERO-HALLUCINATION PRODUCT CLONE. Replicate the exact product shape, color, material, seams, logo, and label text from IMAGE #${imgNum}. Do NOT invent, simplify, or substitute any part of this product.`;
+                }
+                return `• IMAGE #${imgNum} = "@${entry.name}" (${roleLabel}): Use IMAGE #${imgNum} strictly as authentic visual ground truth for "@${entry.name}" wherever referenced in the prompt.`;
+            });
+            referenceBindingBlock = [
+                `=== TARGET REFERENCE PHOTO MAP (${includedEntries.length} ${includedEntries.length === 1 ? 'Photo' : 'Photos'} Attached) ===`,
+                'Every @mention and reference photo below corresponds 1-to-1 to the exact attached IMAGE # above:',
+                ...lines,
+                'MANDATORY FIDELITY RULE: Do NOT hallucinate, redesign, recolor, or alter the target product/subject shown in the referenced IMAGE #(s). Keep every physical contour, texture, logo, and label faithful to the source photograph.'
+            ].join('\n');
+        }
+
+        let swapDirectiveBlock = '';
+        if (swapIntent) {
+            if (swapIntent.swapKind === 'object') {
+                swapDirectiveBlock = [
+                    '=== CRITICAL PRODUCT / OBJECT SWAP EXECUTION MANDATE (HIGHEST PRIORITY) ===',
+                    `The user explicitly requested a DIRECT PRODUCT / OBJECT REPLACEMENT between IMAGE #1 and IMAGE #2:`,
+                    `1. IMAGE #1 ("@${swapIntent.targetSceneEntry.name}") = TARGET BASE SCENE PHOTO:`,
+                    `   - PRESERVE THIS SCENE 100%: Keep the exact background, lighting, surface, camera angle, framing, shadows, depth of field, and all surrounding elements intact.`,
+                    `   - REMOVE & REPLACE ONLY "${swapIntent.targetSubjectDesc}": Completely remove the existing "${swapIntent.targetSubjectDesc}" in IMAGE #1 and place the exact product/item from IMAGE #2 in its exact spot and perspective.`,
+                    `2. IMAGE #2 ("@${swapIntent.sourceSubjectEntry.name}") = REPLACEMENT PRODUCT / OBJECT (EXACT GROUND TRUTH):`,
+                    `   - EXACT PHYSICAL CLONE: Faithfully reproduce the exact product silhouette, proportions, packaging/material finish, seams, colors, brand logo, and label typography from IMAGE #2 with ZERO hallucination.`,
+                    `   - STRICTLY DISCARD SOURCE BACKGROUND: Do NOT copy or blend any background from IMAGE #2. Extract ONLY the product/item and composite it naturally with realistic contact shadows and reflections matching IMAGE #1.`
+                ].join('\n');
+            } else {
+                const outfitInstruction = swapIntent.outfitDirective === 'keep-scene-outfit'
+                    ? `OUTFIT RULE: Keep the exact clothing/outfit worn by "${swapIntent.targetSubjectDesc}" in IMAGE #1 ("@${swapIntent.targetSceneEntry.name}"), transferring ONLY the replacement person's head, face, hair, ethnicity, skin tone, and body features.`
+                    : swapIntent.outfitDirective === 'keep-source-outfit'
+                        ? `OUTFIT RULE: Keep the clothing/outfit worn by "${swapIntent.sourceSubjectDesc}" in IMAGE #2 ("@${swapIntent.sourceSubjectEntry.name}") along with their face, hair, ethnicity, and skin tone.`
+                        : `OUTFIT RULE: Keep "${swapIntent.sourceSubjectDesc}"'s exact face, skin tone, ethnicity, hair, and likeness, dressed naturally to fit the scene in IMAGE #1.`;
+
+                swapDirectiveBlock = [
+                    '=== CRITICAL CHARACTER / SUBJECT SWAP EXECUTION MANDATE (HIGHEST PRIORITY) ===',
+                    `The user explicitly requested a DIRECT CHARACTER SWAP between IMAGE #1 and IMAGE #2:`,
+                    `1. IMAGE #1 ("@${swapIntent.targetSceneEntry.name}") = TARGET BASE SCENE PHOTO:`,
+                    `   - PRESERVE THIS SCENE 100%: Keep the exact environment, background, camera angle, framing, color grading, lighting, props, and all other people completely intact.`,
+                    `   - REMOVE & REPLACE ONLY "${swapIntent.targetSubjectDesc}": Completely remove the existing "${swapIntent.targetSubjectDesc}" and place the person from IMAGE #2 in that exact position.`,
+                    `2. IMAGE #2 ("@${swapIntent.sourceSubjectEntry.name}") = REPLACEMENT CHARACTER SOURCE:`,
+                    `   - TRANSFER THIS EXACT PERSON: Faithfully clone the exact facial structure, skin tone, ethnic heritage, melanin complexion, age, and hair texture from IMAGE #2.`,
+                    `   - STRICTLY DISCARD SOURCE BACKGROUND: Do NOT copy or blend any background from IMAGE #2.`,
+                    `3. ${outfitInstruction}`,
+                    `4. SEAMLESS COMPOSITING: Match lighting direction, shadow softness, ambient color bounce, and focal blur of IMAGE #1.`
+                ].join('\n');
+            }
+        }
+
+        const resolutionQualityNote = (imageSize === '6K' || imageSize === '8K') 
+            ? `IMPORTANT: High-resolution ${imageSize} render. Capture fine micro-textures, crisp focus, and authentic surface detail.` 
+            : '';
+
+        let effectiveNegative = sanitizeNegativePrompt(negativePrompt || '');
+        const characterNegatives = generateCharacterNegativeTerms(activeCharacters);
+        if (characterNegatives) {
+            effectiveNegative = effectiveNegative ? `${effectiveNegative}, ${characterNegatives}` : characterNegatives;
+        }
+        if (swapIntent) {
+            const swapNegatives = swapIntent.swapKind === 'object'
+                ? `original replaced ${swapIntent.targetSubjectDesc} from ${swapIntent.targetSceneEntry.name}, wrong background from ${swapIntent.sourceSubjectEntry.name}, altered logo, garbled label text, generic substitute product, mismatched perspective`
+                : `original face of replaced ${swapIntent.targetSubjectDesc} from ${swapIntent.targetSceneEntry.name}, wrong background from ${swapIntent.sourceSubjectEntry.name}, blended background, cut-and-paste seams, altered skin tone, whitewashed face`;
+            effectiveNegative = effectiveNegative ? `${effectiveNegative}, ${swapNegatives}` : swapNegatives;
+        }
+
+        // Only inject human skin / character realism rules when the prompt or references actually involve people!
+        const hasPeopleInPrompt =
+            activeCharacters.length > 0 ||
+            includedEntries.some(x => x.entry.category === 'Model & Character') ||
+            (swapIntent?.swapKind === 'character') ||
+            /\b(person|people|woman|man|model|athlete|hand|hands|holding|wearing|portrait|face|skin|girl|boy|customer|runner|body)\b/i.test(rawPrompt);
+
+        const skinRealismDirective = hasPeopleInPrompt
+            ? 'HUMAN & SKIN REALISM DIRECTIVE: For any person, face, or hands in the image, render natural realistic skin texture, authentic complexion, and true-to-life lighting without plastic or airbrushed artifacts.'
+            : '';
+
+        const promptInstructions = [
+            swapDirectiveBlock,
+            referenceBindingBlock,
+            `USER PROMPT (FOLLOW EXACTLY):\n${rawPrompt}`,
+            characterDemographicDirectives,
+            skinRealismDirective,
+            resolutionQualityNote,
+            effectiveNegative ? `Strict Exclusion: Do not include ${effectiveNegative}.` : '',
+        ].filter(Boolean);
+
+        return {
+            promptText: promptInstructions.join('\n\n'),
+            rawPrompt,
+            swapIntent,
+            itemMultimodalParts
+        };
+    };
+
+    const imageConfig: any = {
+        aspectRatio: mapToApiAspectRatio(aspectRatio),
+    };
+    if (primaryModel === 'gemini-3-pro-image' || primaryModel === 'gemini-3.1-flash-image' || primaryModel === 'gemini-nano-banana-2.1') {
+        imageConfig.imageSize = mapToApiImageSize(imageSize, primaryModel);
+    }
+
+    let activeIndices: number[] = [];
+    if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
+        activeIndices = fullPrompt
+            .map((p, idx) => (p && p.trim() !== '') ? idx : -1)
+            .filter(idx => idx !== -1);
+        if (activeIndices.length === 0) {
+            activeIndices = [0];
+        }
+    } else {
+        activeIndices = Array.from({ length: variationsCount }).map((_, idx) => idx);
+    }
+
+    const items = activeIndices.map(variantIndex => {
+        const promptBoxIndex = promptBoxIndices?.[variantIndex] !== undefined
+            ? promptBoxIndices[variantIndex]
+            : (soloPromptIndex !== undefined && soloPromptIndex !== null
+                ? soloPromptIndex
+                : variantIndex);
+        const promptBoxNumber = promptBoxIndex + 1;
+        const promptId = params.promptIds?.[variantIndex] || String(promptBoxNumber);
+        const isSolo = soloPromptIndex !== undefined && soloPromptIndex !== null;
+        const promptTitle = promptMode === 'multiple' 
+            ? (isSolo 
+                ? `Prompt Box #${soloPromptIndex + 1} (Solo Mode • Variation ${variantIndex + 1})`
+                : `Prompt Box #${promptBoxNumber}${params.promptIds?.[variantIndex] ? ` (ID: ${params.promptIds[variantIndex]})` : ''}`)
+            : promptMode === 'full' 
+                ? 'Full Custom Prompt Box' 
+                : 'Guided Mode Prompt';
+
+        let promptSnippet = '';
+        if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
+            promptSnippet = fullPrompt[variantIndex]?.trim().slice(0, 100) || '';
+        } else if (typeof fullPrompt === 'string') {
+            promptSnippet = fullPrompt.trim().slice(0, 100);
+        }
+
+        const { promptText, itemMultimodalParts } = buildTargetedItem(variantIndex);
+        const targetFileName = params.promptFileNames?.[variantIndex]?.trim();
+        const promptRefs = params.promptReferenceImages?.[variantIndex];
+
+        return {
+            index: variantIndex,
+            promptText,
+            promptTitle,
+            promptBoxNumber,
+            promptBoxIndex,
+            promptId,
+            fileName: targetFileName || undefined,
+            referenceImages: promptRefs,
+            promptSnippet,
+            itemMultimodalParts
+        };
+    });
+
+
+    // Execution routing:
+    // If running inside Google AI Studio without a custom override key, use the direct AI Studio
+    // in-browser bridge so window.fetch is intercepted by _aistudio-iframe.js with the user's linked
+    // paid key (e.g., Nedd's Apps • ...SqTs). Otherwise, use the full-stack server-side endpoint.
+    const inAiStudio = typeof window !== 'undefined' && Boolean((window as any).aistudio);
+    const hasCustomKey = Boolean(getCustomApiKey());
+
+    const isProOrBanana = primaryModel === 'gemini-3-pro-image' || primaryModel === 'gemini-nano-banana-2.1';
+    const cfg: any = {
+        aspectRatio: mapToApiAspectRatio(aspectRatio),
+        ...(isProOrBanana ? { imageSize: mapToApiImageSize(imageSize, primaryModel) } : {})
+    };
+
+    let results: any[] = [];
+    let completedCount = 0;
+
+    if (inAiStudio && !hasCustomKey) {
+        console.log(`[generateAdImage] Executing via Google AI Studio native paid key bridge (${items.length} items)...`);
+        const BATCH_SIZE = 2;
+        for (let i = 0; i < items.length; i += BATCH_SIZE) {
+            if (signal.aborted) {
+                const abortErr = new Error("Generation cancelled by user.");
+                abortErr.name = "AbortError";
+                throw abortErr;
+            }
+            const batch = items.slice(i, i + BATCH_SIZE);
+            const batchResults = await Promise.all(
+                batch.map(item => generateSingleImageViaAiStudioBridge(
+                    item, primaryModel, cfg, multimodalParts, signal
+                ))
+            );
+            for (const r of batchResults) {
+                results.push(r);
+                completedCount++;
+                onProgress?.(completedCount, items.length);
+            }
+        }
+    } else {
+        // Execute via server-side endpoint with SSE streaming progress
+        const response = await fetch("/api/gemini/generate-ad-image", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                items,
+                primaryModel,
+                imageConfig: cfg,
+                multimodalParts,
+                stream: true
+            }),
+            signal
+        });
+
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `Server responded with status ${response.status}`);
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+
+        if (contentType.includes('text/event-stream') && response.body) {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let completed = 0;
+
+            while (true) {
+                if (signal?.aborted) {
+                    reader.cancel();
+                    break;
+                }
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data:')) continue;
+                    const dataStr = trimmed.slice(5).trim();
+                    if (!dataStr) continue;
+                    try {
+                        const parsed = JSON.parse(dataStr);
+                        if (parsed.type === 'progress') {
+                            onProgress?.(parsed.current, parsed.total);
+                        } else if (parsed.type === 'item' && parsed.result) {
+                            completed++;
+                            onProgress?.(completed, items.length);
+                            results.push(parsed.result);
+                        } else if (parsed.type === 'done' && Array.isArray(parsed.results)) {
+                            results = parsed.results;
+                        } else if (parsed.type === 'error') {
+                            throw new Error(parsed.error);
+                        }
+                    } catch (e: any) {
+                        if (e.message && e.message !== 'Unexpected end of JSON input') {
+                            console.warn('[Client Stream] Parse notice:', e);
                         }
                     }
-                    if (!gotImage) {
-                        errors.push({ variantIndex, message: "Response was missing image data." });
-                    }
-                } else {
-                    errors.push({ variantIndex, message: "No candidate or content parts returned." });
                 }
-            });
-            
-            if (images.length === 0) {
-                const firstError = errors[0]?.message || "The model did not return any images. Try refining your prompts or image inputs.";
-                throw new Error(firstError);
             }
-            
-            const convertedImages = await Promise.all(
-                images.map(async (img) => {
-                    let webpUrl = await convertToWebP(img.url);
-                    if (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) {
-                        const forceWidth = aspectRatio === '36:13' ? 1920 : undefined;
-                        const forceHeight = aspectRatio === '36:13' ? 693 : undefined;
-                        webpUrl = await cropImageToAspectRatio(webpUrl, ASPECT_RATIO_VALUES[aspectRatio], forceWidth, forceHeight);
-                    }
-                    return {
-                        url: webpUrl,
-                        variantIndex: img.variantIndex
-                    };
-                })
-            );
-
-            return {
-                images: convertedImages,
-                errors
-            };
+        } else {
+            const data = await response.json();
+            results = data.results || [];
         }
 
-    } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') {
-            throw error;
-        }
-        console.error("Error generating ad image:", error);
-        if (error instanceof Error) {
-            if (error.message.toLowerCase().includes('quota') || error.message.toLowerCase().includes('429')) {
-                throw new Error("API Quota Exceeded. If you are using Pro/Ultra models, try switching to the 'Standard' model or wait a few minutes before trying again.");
-            }
-            try {
-                const nestedError = JSON.parse(error.message);
-                if (nestedError?.error?.message) {
-                    throw new Error(`Failed to generate the ad image: ${nestedError.error.message}`);
+        // Automatic Recovery: If any server item failed due to Free Tier Limit / 0 Quota,
+        // and we are in AI Studio, automatically rescue it via the in-browser AI Studio bridge!
+        if (inAiStudio) {
+            for (let i = 0; i < results.length; i++) {
+                const res = results[i];
+                if (res?.error) {
+                    const errLower = (res.error.specificReason || res.error.message || '').toLowerCase();
+                    if (errLower.includes('free tier') || errLower.includes('limit: 0') || errLower.includes('quota') || errLower.includes('resource_exhausted')) {
+                        const originalItem = items.find(it => it.index === res.variantIndex);
+                        if (originalItem) {
+                            console.log(`[generateAdImage] Rescuing failed item ${originalItem.index + 1} with AI Studio native paid key bridge...`);
+                            const recovered = await generateSingleImageViaAiStudioBridge(
+                                originalItem, primaryModel, cfg, multimodalParts, signal
+                            );
+                            if (!recovered.error && recovered.base64) {
+                                results[i] = recovered;
+                            }
+                        }
+                    }
                 }
-            } catch (e) {
-                // Not a JSON error
             }
-            throw new Error(`Failed to generate the ad image: ${error.message}`);
         }
-        throw new Error("An unknown error occurred while generating the ad image.");
     }
+
+    const images: AdVariation[] = [];
+    const errors: GenerationError[] = [];
+
+    for (const res of results) {
+        if (res.error) {
+            errors.push(res.error);
+        } else if (res.base64) {
+            const mime = res.mimeType || 'image/png';
+            images.push({
+                url: `data:${mime};base64,${res.base64}`,
+                variantIndex: res.variantIndex,
+                id: res.id,
+                fileName: res.fileName,
+                referenceImages: res.referenceImages,
+                modelUsed: res.modelUsed || primaryModel
+            });
+        }
+    }
+
+    if (images.length === 0) {
+        return {
+            images: [],
+            errors: errors.sort((a, b) => a.variantIndex - b.variantIndex)
+        };
+    }
+
+    const convertedImages = await Promise.all(
+        images.map(async (img) => {
+            let webpUrl = await convertToWebP(img.url);
+            if (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) {
+                const forceWidth = aspectRatio === '36:13' ? 1920 : undefined;
+                const forceHeight = aspectRatio === '36:13' ? 693 : undefined;
+                webpUrl = await cropImageToAspectRatio(webpUrl, ASPECT_RATIO_VALUES[aspectRatio], forceWidth, forceHeight);
+            }
+            return {
+                url: webpUrl,
+                variantIndex: img.variantIndex,
+                id: img.id,
+                fileName: img.fileName,
+                referenceImages: img.referenceImages,
+                modelUsed: img.modelUsed
+            };
+        })
+    );
+
+    convertedImages.sort((a, b) => (a.variantIndex ?? 0) - (b.variantIndex ?? 0));
+
+    return {
+        images: convertedImages,
+        errors
+    };
 };
 
-export const generateKlingVideo = async (params: { prompt: string, image?: ImageData, duration?: string, aspectRatio?: string, apiKey?: string, secretKey?: string, model?: string }, signal: AbortSignal): Promise<Blob> => {
+/**
+ * Kling video proxy.
+ */
+export const generateKlingVideo = async (
+    params: { prompt: string, image?: ImageData, duration?: string, aspectRatio?: string, apiKey?: string, secretKey?: string, model?: string }, 
+    signal: AbortSignal
+): Promise<Blob> => {
     try {
         const response = await fetch('/api/video/kling/generate', {
             method: 'POST',
@@ -832,10 +1576,8 @@ export const generateKlingVideo = async (params: { prompt: string, image?: Image
 
         const taskId = data.data.task_id;
         
-        // Polling for status
         while (true) {
             if (signal.aborted) throw new Error("Generation cancelled");
-            
             await new Promise(resolve => setTimeout(resolve, 5000));
             
             const queryParams = new URLSearchParams();
@@ -850,14 +1592,12 @@ export const generateKlingVideo = async (params: { prompt: string, image?: Image
             const task = statusData.data;
             if (task.task_status === 'succeed') {
                 const videoUrl = task.task_result.videos[0].url;
-                // Use proxy to bypass CORS
                 const videoRes = await fetch(`/api/video/proxy?url=${encodeURIComponent(videoUrl)}`);
                 if (!videoRes.ok) throw new Error("Failed to download video through proxy");
                 return await videoRes.blob();
             } else if (task.task_status === 'failed') {
                 throw new Error(task.task_status_msg || "Kling generation failed");
             }
-            // Continue polling if 'submitted' or 'processing'
         }
     } catch (error: any) {
         if (signal.aborted || error.name === 'AbortError') {
@@ -869,7 +1609,13 @@ export const generateKlingVideo = async (params: { prompt: string, image?: Image
     }
 };
 
-export const animateImage = async (params: { image: ImageData, prompt: string, settings?: VideoSettingsData, klingKeys?: { apiKey: string, secretKey: string, model: string } }, signal: AbortSignal): Promise<Blob> => {
+/**
+ * Animates a static image into a video via server-side Veo or Kling.
+ */
+export const animateImage = async (
+    params: { image: ImageData, prompt: string, settings?: VideoSettingsData, klingKeys?: { apiKey: string, secretKey: string, model: string } }, 
+    signal: AbortSignal
+): Promise<Blob> => {
     const { image, prompt, settings, klingKeys } = params;
 
     if (settings?.model === 'kling') {
@@ -884,82 +1630,68 @@ export const animateImage = async (params: { image: ImageData, prompt: string, s
         }, signal);
     }
 
-    const ai = getAIClient();
-
-    try {
-        if (signal.aborted) {
-            const error = new Error("Generation cancelled by user.");
-            error.name = "AbortError";
-            throw error;
-        }
-
-        const resizedImage = await resizeImage(image);
-
-        const videoPrompt = [
-            prompt || 'Animate this image in a cinematic way.',
-            settings?.cameraType ? `Camera: ${settings.cameraType}.` : '',
-            settings?.technique ? `Technique: ${settings.technique}.` : '',
-            settings?.lighting ? `Lighting: ${settings.lighting}.` : '',
-            settings?.duration ? `Duration: ${settings.duration}.` : '',
-        ].filter(Boolean).join(' ');
-
-        let operation = await ai.models.generateVideos({
-            model: 'veo-3.1-fast-generate-preview',
-            prompt: videoPrompt,
-            image: {
-                imageBytes: resizedImage.base64,
-                mimeType: resizedImage.mimeType
-            },
-            config: {
-                numberOfVideos: 1,
-                resolution: settings?.resolution || '1080p',
-                aspectRatio: settings?.aspectRatio || '16:9',
-            }
-        });
-
-        while (!operation.done) {
-            if (signal.aborted) throw new Error("Generation cancelled");
-            await new Promise(resolve => setTimeout(resolve, 5000));
-            operation = await ai.operations.getVideosOperation({ operation });
-        }
-
-        if (operation.response?.generatedVideos?.[0]?.video?.uri) {
-            const videoUri = operation.response.generatedVideos[0].video.uri;
-            const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
-            const response = await fetch(`${videoUri}&key=${apiKey}`);
-            if (!response.ok) throw new Error("Failed to download video");
-            return await response.blob();
-        }
-        throw new Error("The AI did not return a video.");
-    } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') {
-            throw error;
-        }
-        console.error("Error animating image:", error);
+    if (signal.aborted) {
+        const error = new Error("Generation cancelled by user.");
+        error.name = "AbortError";
         throw error;
     }
+
+    const resizedImage = await resizeImage(image);
+    const videoPrompt = [
+        prompt || 'Animate this image in a cinematic way.',
+        settings?.cameraType ? `Camera: ${settings.cameraType}.` : '',
+        settings?.technique ? `Technique: ${settings.technique}.` : '',
+        settings?.lighting ? `Lighting: ${settings.lighting}.` : '',
+        settings?.duration ? `Duration: ${settings.duration}.` : '',
+    ].filter(Boolean).join(' ');
+
+    const response = await fetch("/api/gemini/animate-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            image: {
+                base64: resizedImage.base64,
+                mimeType: resizedImage.mimeType
+            },
+            prompt: videoPrompt,
+            settings
+        }),
+        signal
+    });
+
+    if (!response.ok) {
+        const errorJson = await response.json().catch(() => ({}));
+        throw new Error(errorJson.error || `Server responded with ${response.status}`);
+    }
+
+    return await response.blob();
 };
-export const generateAdVideo = async (params: GenerateAdParams & { videoModel?: VideoModel, klingKeys?: { apiKey: string, secretKey: string, model: string } }, signal: AbortSignal): Promise<Blob> => {
-     const { 
-        productImage, productImages, subjectImages, modelImages, poseImages, productName, backgroundPrompt, slogan, placement, fullPrompt, videoModel, klingKeys, promptMode
-     } = params;
 
-     let sceneDescription = '';
-    
-     if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
-         sceneDescription = (fullPrompt[0] && typeof fullPrompt[0] === 'string' && fullPrompt[0].trim().length > 0) 
-             ? fullPrompt[0] 
-             : `A professional commercial video of ${productName || 'the product'}.`;
-     } else if (promptMode === 'full' && typeof fullPrompt === 'string' && fullPrompt.trim().length > 0) {
-         sceneDescription = fullPrompt.trim();
-     } else {
-         sceneDescription = `A cinematic product ad for "${productName || 'the product'}". The scene: ${backgroundPrompt}. ${placement}. Slogan: ${slogan}.`;
-     }
+/**
+ * Generates an advertising video via server-side Veo or Kling.
+ */
+export const generateAdVideo = async (
+    params: GenerateAdParams & { videoModel?: VideoModel, klingKeys?: { apiKey: string, secretKey: string, model: string } }, 
+    signal: AbortSignal
+): Promise<Blob> => {
+    const { 
+        productImage, productImages, subjectImages, productName, backgroundPrompt, slogan, placement, fullPrompt, videoModel, klingKeys, promptMode
+    } = params;
 
-     const prompt = `Create a high-quality advertising video. ${sceneDescription}`;
+    let sceneDescription = '';
+    if (promptMode === 'multiple' && Array.isArray(fullPrompt)) {
+        sceneDescription = (fullPrompt[0] && typeof fullPrompt[0] === 'string' && fullPrompt[0].trim().length > 0) 
+            ? fullPrompt[0] 
+            : `A professional commercial video of ${productName || 'the product'}.`;
+    } else if (promptMode === 'full' && typeof fullPrompt === 'string' && fullPrompt.trim().length > 0) {
+        sceneDescription = fullPrompt.trim();
+    } else {
+        sceneDescription = `A cinematic product ad for "${productName || 'the product'}". The scene: ${backgroundPrompt}. ${placement}. Slogan: ${slogan}.`;
+    }
 
-     if (videoModel === 'kling') {
-        // For Kling, we use the productImage or the first productImages as the main reference
+    const prompt = `Create a high-quality advertising video. ${sceneDescription}`;
+
+    if (videoModel === 'kling') {
         return generateKlingVideo({
             prompt,
             image: productImage || (productImages && productImages[0]) || undefined,
@@ -969,83 +1701,58 @@ export const generateAdVideo = async (params: GenerateAdParams & { videoModel?: 
             secretKey: klingKeys?.secretKey,
             model: klingKeys?.model
         }, signal);
-     }
+    }
 
-     const ai = getAIClient();
+    if (signal.aborted) {
+        const error = new Error("Generation cancelled by user.");
+        error.name = "AbortError";
+        throw error;
+    }
 
-     try {
-        if (signal.aborted) {
-             const error = new Error("Generation cancelled by user.");
-             error.name = "AbortError";
-             throw error;
-        }
+    const mainProductImage = productImage || (productImages && productImages[0]) || null;
+    const resizedProductImage = mainProductImage ? await resizeImage(mainProductImage) : null;
+    const resizedSubjectImages = subjectImages ? await Promise.all(subjectImages.map(img => resizeImage(img))) : [];
 
-        const mainProductImage = productImage || (productImages && productImages[0]) || null;
-        const resizedProductImage = mainProductImage ? await resizeImage(mainProductImage) : null;
-        const resizedSubjectImages = subjectImages ? await Promise.all(subjectImages.map(img => resizeImage(img))) : [];
+    const referenceImages: any[] = [];
+    if (resizedProductImage) {
+        referenceImages.push({
+            imageBytes: resizedProductImage.base64,
+            mimeType: resizedProductImage.mimeType,
+            referenceType: 'ASSET'
+        });
+    }
 
-        const referenceImages: any[] = [];
-        
-        if (resizedProductImage) {
+    if (resizedSubjectImages && resizedSubjectImages.length > 0) {
+        resizedSubjectImages.slice(0, 2).forEach(img => {
             referenceImages.push({
-                image: {
-                    imageBytes: resizedProductImage.base64,
-                    mimeType: resizedProductImage.mimeType
-                },
+                imageBytes: img.base64,
+                mimeType: img.mimeType,
                 referenceType: 'ASSET'
             });
-        }
-
-        if (resizedSubjectImages && resizedSubjectImages.length > 0) {
-            resizedSubjectImages.slice(0, 2).forEach(img => {
-                referenceImages.push({
-                    image: {
-                        imageBytes: img.base64,
-                        mimeType: img.mimeType
-                    },
-                    referenceType: 'ASSET'
-                });
-            });
-        }
-
-        let operation = await ai.models.generateVideos({
-            model: referenceImages.length > 1 ? 'veo-3.1-generate-preview' : 'veo-3.1-fast-generate-preview',
-            prompt: prompt,
-            config: {
-                numberOfVideos: 1,
-                resolution: referenceImages.length > 1 ? '720p' : '1080p', // 720p required for multi-ref
-                aspectRatio: '16:9',
-                referenceImages: referenceImages.length > 0 ? referenceImages : undefined
-            }
         });
-
-        while (!operation.done) {
-             if (signal.aborted) throw new Error("Generation cancelled");
-             await new Promise(resolve => setTimeout(resolve, 5000));
-             operation = await ai.operations.getVideosOperation({operation});
-        }
-
-        if (operation.response?.generatedVideos?.[0]?.video?.uri) {
-             const videoUri = operation.response.generatedVideos[0].video.uri;
-             // Must append API key for Veo downloads
-             const response = await fetch(`${videoUri}&key=${process.env.API_KEY}`);
-             if (!response.ok) throw new Error("Failed to download video");
-             return await response.blob();
-        }
-        
-        throw new Error("No video generated");
-
-    } catch (error: any) {
-        if (signal.aborted || error.name === 'AbortError') {
-             const e = new Error("Generation cancelled by user.");
-             e.name = "AbortError";
-             throw e;
-        }
-        console.error("Error generating video:", error);
-        throw new Error(error.message || "Video generation failed");
     }
+
+    const response = await fetch("/api/gemini/generate-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            prompt,
+            referenceImages
+        }),
+        signal
+    });
+
+    if (!response.ok) {
+        const errorJson = await response.json().catch(() => ({}));
+        throw new Error(errorJson.error || `Server responded with ${response.status}`);
+    }
+
+    return await response.blob();
 };
 
+/**
+ * Edits an ad image via server-side Gemini.
+ */
 export const editAdImage = async (
     image: string,
     action: 'upscale' | 'pan' | 'zoom' | 'vary',
@@ -1056,7 +1763,6 @@ export const editAdImage = async (
     }
 ): Promise<string> => {
     try {
-        const ai = getAIClient();
         const imageData = dataUrlToImageData(image);
         const resizedImageData = await resizeImage(imageData);
         let prompt = '';
@@ -1070,9 +1776,9 @@ export const editAdImage = async (
                 break;
             case 'zoom':
                 if (options.direction === 'in') {
-                   prompt = `Zoom in on the center of the image. The zoom level should be approximately ${options.level}. Preserve high resolution and detail.`;
+                    prompt = `Zoom in on the center of the image. The zoom level should be approximately ${options.level}. Preserve high resolution and detail.`;
                 } else {
-                   prompt = `Zoom out from this image. This image is the center crop of a larger scene. Generate the surrounding context seamlessly.`;
+                    prompt = `Zoom out from this image. This image is the center crop of a larger scene. Generate the surrounding context seamlessly.`;
                 }
                 break;
             case 'vary':
@@ -1080,27 +1786,382 @@ export const editAdImage = async (
                 break;
         }
 
-        const response = await ai.models.generateContent({
-             model: 'gemini-2.5-flash-image',
-             contents: {
-                parts: [
-                    { inlineData: { data: resizedImageData.base64, mimeType: resizedImageData.mimeType } },
-                    { text: prompt }
-                ]
-             },
-             config: { responseModalities: [Modality.IMAGE] }
+        const inAiStudio = typeof window !== 'undefined' && Boolean((window as any).aistudio);
+        const hasCustomKey = Boolean(getCustomApiKey());
+
+        if (inAiStudio && !hasCustomKey) {
+            try {
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-image:generateContent`;
+                const editResp = await window.fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'User-Agent': 'aistudio-build' },
+                    body: JSON.stringify({
+                        contents: [{
+                            role: 'user',
+                            parts: [
+                                { inlineData: { mimeType: resizedImageData.mimeType, data: resizedImageData.base64 } },
+                                { text: prompt }
+                            ]
+                        }]
+                    })
+                });
+                if (editResp.ok) {
+                    const editData = await editResp.json();
+                    const editPart = editData?.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData && p.inlineData.data);
+                    if (editPart) {
+                        const originalDataUrl = `data:${editPart.inlineData.mimeType || 'image/png'};base64,${editPart.inlineData.data}`;
+                        return convertToWebP(originalDataUrl);
+                    }
+                }
+            } catch (bridgeErr) {
+                console.warn('[editAdImage] AI Studio bridge failed, attempting server fallback:', bridgeErr);
+            }
+        }
+
+        const response = await fetch("/api/gemini/edit-image", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                image: {
+                    base64: resizedImageData.base64,
+                    mimeType: resizedImageData.mimeType
+                },
+                prompt
+            })
         });
 
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-             if (part.inlineData) {
-                 const originalDataUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-                 return convertToWebP(originalDataUrl);
-             }
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || `Server responded with ${response.status}`);
         }
-        throw new Error("No image returned from edit operation.");
 
+        const data = await response.json();
+        if (data.data) {
+            const originalDataUrl = `data:${data.mimeType || 'image/png'};base64,${data.data}`;
+            return convertToWebP(originalDataUrl);
+        }
+        throw new Error("No image data returned from server edit operation.");
     } catch (error) {
-         console.error("Error editing image:", error);
-         throw new Error("Failed to edit image.");
+        console.error("Error editing image via server:", error);
+        throw new Error("Failed to edit image.");
     }
 };
+
+/**
+ * Inserts a portrait or model photo into an original reference scene photo via server.
+ */
+export const insertModelIntoScene = async (
+    params: InsertModelParams,
+    signal?: AbortSignal,
+    _onProgress?: (current: number, total: number) => void
+): Promise<ImageGenerationResponse> => {
+    const {
+        sceneImage,
+        modelImage,
+        mode = params.blendingMode === 'replace-subject' ? 'swap' : 'insert',
+        targetSubject = 'the existing person',
+        outfitMode = 'harmonize',
+        placement = 'Center foreground',
+        actionOrPose = 'Relaxed and natural posture looking towards camera with a warm expression',
+        clothingStyle = 'Aesthetic outfit naturally harmonizing with the environment',
+        blendingMode = mode === 'swap' ? 'replace-subject' : 'seamless-blend',
+        customNotes = '',
+        aspectRatio = '1:1',
+        modelType = 'pro',
+        imageSize = '2K',
+        numberOfVariations = 1,
+        excludeHandheldProps = true
+    } = params;
+
+    const count = Math.max(1, Math.min(numberOfVariations || 1, 4));
+
+    if (signal?.aborted) {
+        const error = new Error("Generation cancelled by user.");
+        error.name = "AbortError";
+        throw error;
+    }
+
+    const [resizedScene, resizedModel] = await Promise.all([
+        resizeImage(sceneImage, 1536),
+        resizeImage(modelImage, 1536)
+    ]);
+
+    const propExclusionInstruction = excludeHandheldProps !== false
+        ? 'HANDS & POSTURE: Hands must be natural and clean without adding stray handheld tools, hair wands, or devices from the reference portrait.'
+        : '';
+
+    const isSwapMode = mode === 'swap' || blendingMode === 'replace-subject';
+
+    const outfitInstruction = isSwapMode
+        ? (outfitMode === 'keep-scene-outfit'
+            ? `WARDROBE & OUTFIT RULE: Keep the exact outfit/clothing currently worn by ${targetSubject} in the TARGET BASE SCENE PHOTO ("${sceneImage.name || 'scene photo'}"). Transfer ONLY the replacement person's face, ethnicity, skin tone, hair, and likeness into that exact outfit and pose.`
+            : outfitMode === 'keep-model-outfit'
+                ? `WARDROBE & OUTFIT RULE: Dress the replacement person in their own outfit/clothing from the REPLACEMENT PERSON PHOTO ("${modelImage.name || 'replacement photo'}"), while matching lighting and shadows of the target scene.`
+                : `WARDROBE & OUTFIT RULE: ${clothingStyle || 'Harmonize attire naturally with the target scene aesthetic while preserving replacement character authenticity.'}`)
+        : `WARDROBE & ATTIRE: ${clothingStyle}`;
+
+    const blendInstruction = isSwapMode
+        ? `DIRECT CHARACTER SWAP: Completely remove "${targetSubject}" from the TARGET BASE SCENE PHOTO and replace them in that exact position/role with the person from the REPLACEMENT PERSON PHOTO.`
+        : blendingMode === 'subtle-background'
+            ? 'SUBTLE BACKGROUND PLACEMENT: Place the model naturally into the mid-ground/background of the scene as a natural element of the environment.'
+            : blendingMode === 'hero-foreground'
+                ? 'HERO FOREGROUND PLACEMENT: The model is the primary hero focal point in the immediate foreground, commanding attention while naturally inhabiting the environment.'
+                : 'SEAMLESS COMPOSITING: Insert the model into the scene naturally as an integral part of the original photographic moment.';
+
+    const variationModifiers = isSwapMode
+        ? [
+            'Faithfully preserve exact scene lighting, pose, camera perspective, and natural facial expression.',
+            'Subtle natural expression adjustment matching the target scene mood and ambient shadow falloff.',
+            'Crisp photorealistic skin pores, natural lighting integration, and exact depth of field match.',
+            'Seamless organic contact shadows and true-to-life environmental color bounce.'
+        ]
+        : [
+            'Direct gaze with natural warm confidence and subtle cinematic rim lighting.',
+            'Candid relaxed expression, looking slightly off-camera with soft natural ambient lighting.',
+            'Engaging warm smile with crisp authentic depth of field matching the background.',
+            'Polished editorial pose with natural organic shadows cast upon the floor/surroundings.'
+        ];
+
+    const prompts = Array.from({ length: count }).map((_, idx) => {
+        const variationNote = count > 1 ? `VARIATION ${idx + 1} NUANCE: ${variationModifiers[idx % variationModifiers.length]}` : '';
+        if (isSwapMode) {
+            return [
+                'You are an expert commercial photographic compositor and master AI character replacement specialist.',
+                '',
+                'ATTACHED IMAGES & STRICT ROLES:',
+                `• [IMAGE ROLE 1 — TARGET BASE SCENE PHOTO: "${sceneImage.name || 'target_scene'}"] (First attached image): Keep 100% of this scene\'s background, environment, camera angle, framing, depth of field, props, lighting, and any other people intact. ONLY "${targetSubject}" in this scene is to be replaced.`,
+                `• [IMAGE ROLE 2 — REPLACEMENT CHARACTER SOURCE PHOTO: "${modelImage.name || 'replacement_person'}"] (Second attached image): Extract ONLY this person\'s exact face, facial structure, ethnicity, skin tone, melanin complexion, age, and hair texture. STRICTLY DISCARD and ignore the background/room of this second image.`,
+                '',
+                'MANDATORY CHARACTER SWAP DIRECTIVES:',
+                `1. COMPLETE REPLACEMENT: Completely remove "${targetSubject}" from IMAGE ROLE 1 and replace them seamlessly with the exact person from IMAGE ROLE 2 in the same spot/scene role.`,
+                '2. 100% IDENTITY, ETHNICITY & RACIAL FIDELITY: Faithfully preserve the exact ethnicity, skin tone, melanin richness, eye shape, facial morphology, and natural hair texture of the person in IMAGE ROLE 2. Under NO circumstances whitewash, lighten, or blend facial features with the removed person.',
+                `3. ${outfitInstruction}`,
+                `4. POSE & EXPRESSION: ${actionOrPose}.`,
+                propExclusionInstruction ? `5. ${propExclusionInstruction}` : '',
+                '6. ZERO BACKGROUND BLEED: Do NOT copy any walls, furniture, floor, or background elements from IMAGE ROLE 2 into IMAGE ROLE 1.',
+                '7. PHOTOGRAPHIC LIGHTING & SHADOWS: Match the exact light direction, ambient color cast, exposure, shadows, and focal blur of IMAGE ROLE 1.',
+                customNotes ? `ADDITIONAL USER DIRECTION: ${customNotes}` : '',
+                variationNote,
+                '',
+                `STRICT EXCLUSION: Original face of removed ${targetSubject}, background from ${modelImage.name || 'replacement photo'}, whitewashed skin, altered race, lightened skin tone, floating figure, cut-and-paste seams, lighting mismatch, bad hands, extra fingers, cartoon, distorted face.`
+            ].filter(Boolean).join('\n');
+        }
+
+        return [
+            'You are an expert commercial photographic compositor and master AI visual retoucher.',
+            '',
+            'ATTACHED IMAGES AND ROLES:',
+            `• [IMAGE ROLE 1 — ORIGINAL BASE SCENE PHOTO: "${sceneImage.name || 'scene'}"]: Establishes the exact location, background, lighting atmosphere, perspective, room architecture, color temperature, and photographic style.`,
+            `• [IMAGE ROLE 2 — PORTRAIT / MODEL REFERENCE PHOTO: "${modelImage.name || 'model'}"]: Provides the precise facial features, smile, eye shape, ethnicity, skin tone, facial structure, and hair texture of the person to insert.`,
+            '',
+            'TASK:',
+            'Seamlessly composite and insert the person from IMAGE ROLE 2 directly into the original scene from IMAGE ROLE 1.',
+            '',
+            'MANDATORY COMPOSITING INSTRUCTIONS:',
+            '1. MODEL IDENTITY, ETHNICITY & RACIAL FIDELITY: Faithfully portray the person from IMAGE ROLE 2 with matching ethnicity, skin tone, melanin complexion, eye color, smile, and hair texture. Under NO circumstances lighten, whitewash, or alter their ethnic background or skin complexion. The person\'s racial identity must be 100% authentically preserved.',
+            `2. ${propExclusionInstruction}`,
+            `3. PLACEMENT & POSITION: ${placement}.`,
+            `4. POSE & EXPRESSION: ${actionOrPose}.`,
+            `5. ${outfitInstruction}`,
+            `6. BLENDING MODE: ${blendInstruction}`,
+            '7. PHOTOGRAPHIC LIGHTING & SHADOWS: The lighting on the model must 100% match the direction, softness, ambient bounced color, and shadow angles of IMAGE ROLE 1. Realistic contact shadows must be cast on any ground, floor, furniture, or background surfaces.',
+            '8. PERSPECTIVE & CAMERA MATCH: Match the focal length, depth of field blur, and lens perspective of IMAGE ROLE 1. The result must look like an authentic, unedited single photograph taken on location.',
+            customNotes ? `ADDITIONAL USER DIRECTION: ${customNotes}` : '',
+            variationNote,
+            '',
+            'STRICT EXCLUSION: Whitewashed skin, altered race, lightened skin tone, curling iron, hair styling wand, handheld tools, floating person, cut-and-paste seams, lighting mismatch, bad hands, extra fingers, cartoon, distorted face.'
+        ].filter(Boolean).join('\n');
+    });
+
+    const primaryModel = resolveImageModelName(modelType);
+    const apiAspectRatio = mapToApiAspectRatio(aspectRatio);
+    const apiImageSize = mapToApiImageSize(imageSize, primaryModel);
+
+    const interleavedParts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = [
+        { text: `[IMAGE ROLE 1 — TARGET BASE SCENE PHOTO: "${sceneImage.name || 'target_scene'}"]` },
+        { inlineData: { data: resizedScene.base64, mimeType: resizedScene.mimeType } },
+        { text: `[IMAGE ROLE 2 — ${isSwapMode ? 'REPLACEMENT CHARACTER SOURCE' : 'MODEL TO INSERT'}: "${modelImage.name || 'model_photo'}"]` },
+        { inlineData: { data: resizedModel.base64, mimeType: resizedModel.mimeType } }
+    ];
+
+    const inAiStudio = typeof window !== 'undefined' && Boolean((window as any).aistudio);
+    const hasCustomKey = Boolean(getCustomApiKey());
+
+    let rawResults: Array<{ data?: string; mimeType?: string; variantIndex: number; error?: string }> = [];
+
+    if (inAiStudio && !hasCustomKey) {
+        const bridgePromises = prompts.map(async (promptText, idx) => {
+            const bridgeItem = {
+                index: idx,
+                promptText,
+                promptTitle: isSwapMode ? `Character Swap #${idx + 1}` : `Model Composite #${idx + 1}`,
+                promptBoxIndex: idx,
+                promptBoxNumber: idx + 1,
+                promptId: String(idx + 1),
+                itemMultimodalParts: interleavedParts
+            };
+            const res = await generateSingleImageViaAiStudioBridge(
+                bridgeItem,
+                primaryModel,
+                { aspectRatio: apiAspectRatio, imageSize: apiImageSize },
+                interleavedParts,
+                signal
+            );
+            return {
+                variantIndex: idx,
+                data: res.base64,
+                mimeType: res.mimeType,
+                error: res.error?.specificReason || res.error?.message
+            };
+        });
+        rawResults = await Promise.all(bridgePromises);
+    } else {
+        const response = await fetch("/api/gemini/insert-model", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                sceneImage: {
+                    base64: resizedScene.base64,
+                    mimeType: resizedScene.mimeType,
+                    name: sceneImage.name
+                },
+                modelImage: {
+                    base64: resizedModel.base64,
+                    mimeType: resizedModel.mimeType,
+                    name: modelImage.name
+                },
+                prompts,
+                modelUsed: primaryModel,
+                aspectRatio: apiAspectRatio,
+                imageSize: apiImageSize
+            }),
+            signal
+        });
+
+        if (!response.ok) {
+            const errorJson = await response.json().catch(() => ({}));
+            throw new Error(errorJson.error || `Server responded with ${response.status}`);
+        }
+
+        const data = await response.json();
+        rawResults = data.results || [];
+
+        // Auto-rescue with AI Studio bridge if server hit free-tier/quota limits
+        if (inAiStudio) {
+            for (let i = 0; i < rawResults.length; i++) {
+                const res = rawResults[i];
+                if (res?.error) {
+                    const errLower = String(res.error).toLowerCase();
+                    if (errLower.includes('free tier') || errLower.includes('limit: 0') || errLower.includes('quota') || errLower.includes('resource_exhausted')) {
+                        const bridgeItem = {
+                            index: res.variantIndex,
+                            promptText: prompts[res.variantIndex] || prompts[0],
+                            promptTitle: isSwapMode ? `Character Swap #${res.variantIndex + 1}` : `Model Composite #${res.variantIndex + 1}`,
+                            promptBoxIndex: res.variantIndex,
+                            promptBoxNumber: res.variantIndex + 1,
+                            promptId: String(res.variantIndex + 1),
+                            itemMultimodalParts: interleavedParts
+                        };
+                        const rescued = await generateSingleImageViaAiStudioBridge(
+                            bridgeItem,
+                            primaryModel,
+                            { aspectRatio: apiAspectRatio, imageSize: apiImageSize },
+                            interleavedParts,
+                            signal
+                        );
+                        if (!rescued.error && rescued.base64) {
+                            rawResults[i] = {
+                                variantIndex: res.variantIndex,
+                                data: rescued.base64,
+                                mimeType: rescued.mimeType
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const convertedImages: AdVariation[] = [];
+    const errors: GenerationError[] = [];
+
+    for (const res of rawResults) {
+        if (res.error) {
+            errors.push({ variantIndex: res.variantIndex, message: res.error });
+            continue;
+        }
+
+        if (res.data) {
+            const rawUrl = `data:${res.mimeType || 'image/png'};base64,${res.data}`;
+            let webpUrl = await convertToWebP(rawUrl);
+            if (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) {
+                webpUrl = await cropImageToAspectRatio(webpUrl, ASPECT_RATIO_VALUES[aspectRatio]);
+            }
+            convertedImages.push({ url: webpUrl, variantIndex: res.variantIndex, modelUsed: primaryModel });
+        }
+    }
+
+    if (convertedImages.length === 0 && errors.length > 0) {
+        throw new Error(errors[0].message || 'Failed to composite or swap character');
+    }
+
+    return {
+        images: convertedImages,
+        errors
+    };
+};
+
+/**
+ * Real-time Gemini Live WebSocket helper for interactive streaming voice/audio.
+ */
+export function connectToGeminiLive(callbacks: {
+    onAudioChunk?: (base64Audio: string) => void;
+    onInterrupted?: () => void;
+    onError?: (err: any) => void;
+    onClose?: () => void;
+}): { sendAudio: (base64Audio: string) => void; sendText: (text: string) => void; close: () => void } {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/gemini/live`;
+    const ws = new WebSocket(wsUrl);
+
+    ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg.audio && callbacks.onAudioChunk) {
+                callbacks.onAudioChunk(msg.audio);
+            }
+            if (msg.interrupted && callbacks.onInterrupted) {
+                callbacks.onInterrupted();
+            }
+            if (msg.error && callbacks.onError) {
+                callbacks.onError(msg.error);
+            }
+        } catch (e) {
+            console.error("Failed to parse Live API message", e);
+        }
+    };
+
+    ws.onerror = (e) => {
+        callbacks.onError?.(e);
+    };
+
+    ws.onclose = () => {
+        callbacks.onClose?.();
+    };
+
+    return {
+        sendAudio: (base64Audio: string) => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ audio: base64Audio }));
+            }
+        },
+        sendText: (text: string) => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ text }));
+            }
+        },
+        close: () => {
+            ws.close();
+        }
+    };
+}
